@@ -1,0 +1,80 @@
+name: CAL app-only firmware
+on:
+  push:
+    branches: ['cal/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: cal-firmware-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  application:
+    name: ${{ matrix.variant }} application
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [debug, production]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: respeaker_clip
+      - name: Host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ccache cmake device-tree-compiler dfu-util file g++-multilib gcc gcc-multilib git gperf make ninja-build python3-dev python3-pip python3-setuptools python3-venv python3-wheel wget xz-utils libsdl2-dev libmagic1
+          pip3 install west
+      - name: Zephyr SDK 0.17.0
+        run: |
+          wget -q --tries=3 --retry-connrefused --waitretry=5 https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v0.17.0/zephyr-sdk-0.17.0_linux-x86_64_minimal.tar.xz
+          tar xf zephyr-sdk-0.17.0_linux-x86_64_minimal.tar.xz -C "$HOME"
+          "$HOME/zephyr-sdk-0.17.0/setup.sh" -c -t arm-zephyr-eabi
+      - name: NCS v3.3.0
+        run: |
+          west init -m https://github.com/nrfconnect/sdk-nrf --mr v3.3.0 ncs
+          cd ncs
+          west update --narrow -o=--depth=1
+          pip3 install -r zephyr/scripts/requirements-base.txt -r nrf/scripts/requirements.txt
+      - name: Apply the board's MCUboot build patches
+        run: |
+          cd ncs/bootloader/mcuboot
+          for patch in "$GITHUB_WORKSPACE"/respeaker_clip/patches/mcuboot/0*.patch; do
+            git apply --check "$patch"
+            git apply "$patch"
+          done
+      - name: Compile the application
+        shell: bash
+        run: |
+          set -o pipefail
+          cd ncs
+          export ZEPHYR_EXTRA_MODULES="$GITHUB_WORKSPACE/respeaker_clip"
+          APP="$GITHUB_WORKSPACE/respeaker_clip/applications/clip"
+          EXTRA=()
+          if [[ '${{ matrix.variant }}' == production ]]; then EXTRA=(-DSNIPPET_ROOT="$APP" -DSNIPPET=production); fi
+          west build -b clip/nrf5340/cpuapp "$APP" --build-dir build --pristine=always -- "${EXTRA[@]}" 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+      - name: Verify and export application image only
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_IMAGE=ncs/build/clip/zephyr/zephyr.signed.bin
+          KEY=respeaker_clip/boards/seeed/clip/sysbuild/root-rsa-2048.pem
+          python3 ncs/bootloader/mcuboot/scripts/imgtool.py verify -k "$KEY" "$APP_IMAGE"
+          if grep -E '(^|[[:space:]])warning:' build.log; then exit 1; fi
+          VERSION=$(python3 -c "import sys;sys.path.insert(0,'respeaker_clip/tools/cal');from artifact import inspect_image;print(inspect_image('$APP_IMAGE')['version'])")
+          SHA=$(git -C respeaker_clip rev-parse --short=12 HEAD)
+          NAME="clip-${VERSION}-${SHA}-${{ matrix.variant }}"
+          mkdir -p output
+          cp "$APP_IMAGE" "output/$NAME.signed.bin"
+          python3 respeaker_clip/tools/cal/artifact.py "output/$NAME.signed.bin" --variant '${{ matrix.variant }}' --source-sha '${{ github.sha }}' --output "output/$NAME.json"
+          cp ncs/build/clip/zephyr/.config output/app.config
+          cp build.log output/build.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cal-app-${{ github.sha }}-${{ matrix.variant }}
+          path: |
+            output/
+            build.log
+          if-no-files-found: warn
