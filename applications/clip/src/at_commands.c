@@ -659,9 +659,9 @@ static int cmd_haptic_handler(struct at_cmd_ctx *ctx, char *response, size_t len
 
 #ifdef CONFIG_CLIP_WDT_TEST
 /* WDTTEST - bench check of the watchdog: AT+WDTTEST=loop hangs the event
- * loop (at its next wake, <= CONFIG_CLIP_WDT_TIMEOUT_MS/4), AT+WDTTEST=audio
- * the audio thread of a running recording. The watchdog must then reset the
- * device within CONFIG_CLIP_WDT_TIMEOUT_MS. */
+ * loop right after one last feed, AT+WDTTEST=audio the audio thread of a
+ * running recording. The watchdog must then reset the device about
+ * CONFIG_CLIP_WDT_TIMEOUT_MS after the reply. */
 static int cmd_wdttest_handler(struct at_cmd_ctx *ctx, char *response, size_t len)
 {
     int which = !ctx->args ? 0 : strcmp(ctx->args, "loop") == 0 ? 1
@@ -674,6 +674,7 @@ static int cmd_wdttest_handler(struct at_cmd_ctx *ctx, char *response, size_t le
         return -AT_ERR_STATE;
     }
     atomic_set(&clip_wdt_hang, which);
+    clip_event_audio_news(0);   /* wake the event loop now */
     return create_json_response(true, NULL, NULL, response, len);
 }
 #endif
