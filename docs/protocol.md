@@ -212,8 +212,17 @@ space and 4 hex digits of the nRF5340 FICR DEVICEID low 16 bits (e.g.
 - While an owner bond exists, any other central is disconnected as soon as
   its security request or pairing attempt fails for lack of a key slot; the
   owner bond is never cleared on its behalf. To pair a different central,
-  the owner (or USB) must send `AT+PAIR=reset` first (this also erases the
-  SD card).
+  the owner must send `AT+PAIR=reset` first (this also erases the SD card).
+  USB is not a separate way in: the app's USB CDC port only appears after
+  `AT+USB=on`, which itself needs the encrypted owner link.
+- **Owner lost** (the bonded central is gone, e.g. a replaced dongle): no
+  other central can pair, and BLE OTA (SMP needs encryption) and
+  `AT+PAIR=reset` are unreachable. Recover through MCUboot serial recovery:
+  hold the button while plugging USB until the OLED shows "Recovery Mode"
+  ([usb_dfu.md](usb_dfu.md)), send the custom **erase settings** mcumgr
+  command (group 64, command 1, MCUboot patch `0004`), reset it with an
+  mcumgr `reset` on the same port, then pair the new central. This also
+  wipes the stored config, time and WiFi password.
 - Owner recovery stays scoped to the owner: if the owner itself deleted its
   bond and re-pairs, the device drops only that peer's stale keys and
   disconnects; the owner pairs fresh on the next connection.
