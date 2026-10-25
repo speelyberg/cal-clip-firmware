@@ -1002,7 +1002,10 @@ int ble_send_audio_vis(const uint8_t *data, uint16_t len)
     return 0;
 }
 
-void ble_adv_restart_fast(void)
+/* Runs on the system workqueue, like adv_work: bt_le_adv_stop() frees the
+ * advertiser's connection object, and the resulting conn_recycled() must
+ * not slip a slow restart in between this stop and the fast start. */
+static void adv_fast_work_handler(struct k_work *work)
 {
     if (ble_is_connected()) {
 	return;
@@ -1022,6 +1025,12 @@ void ble_adv_restart_fast(void)
 
     /* Re-schedule switch to slow advertising */
     k_work_reschedule(&adv_timeout_work, K_MSEC(ADV_FAST_TIMEOUT_MS));
+}
+static K_WORK_DEFINE(adv_fast_work, adv_fast_work_handler);
+
+void ble_adv_restart_fast(void)
+{
+    k_work_submit(&adv_fast_work);
 }
 
 void ble_activity_refresh(void)
