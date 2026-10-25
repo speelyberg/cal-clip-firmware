@@ -1,0 +1,23 @@
+# Normalized warnings from stock v0.1.4 builds (tools/cal/warning_gate.py --write).
+      --- WARNING: SB_CONFIG_PARTITION_MANAGER is enabled, partition manager has been ---
+respeaker_clip/lib/speexdsp/speexdsp/libspeexdsp/_kiss_fft_guts.h:15: warning: "MIN" redefined
+respeaker_clip/lib/speexdsp/speexdsp/libspeexdsp/_kiss_fft_guts.h:16: warning: "MAX" redefined
+respeaker_clip/lib/speexdsp/speexdsp/libspeexdsp/pseudofloat.h:63: warning: "MIN" redefined
+warning: Deprecated symbol MBEDTLS_MD is enabled.
+warning: Deprecated symbol MCUBOOT_VERIFY_IMG_ADDRESS is enabled.
+warning: Deprecated symbol PARTITION_MANAGER is enabled.
+warning: Deprecated symbol PARTITION_MANAGER_ENABLED is enabled.
+warning: Deprecated symbol USB_DEVICE_DRIVER is enabled.
+warning: Deprecated symbol USB_DEVICE_STACK is enabled.
+warning: Experimental symbol NET_BUF_VARIABLE_DATA_SIZE is enabled.
+warning: Experimental symbol WIFI_NM_WPA_SUPPLICANT is enabled.
+warning: Experimental symbol WIFI_READY_LIB is enabled.
+warning: LOG_DEFAULT_LEVEL (defined at subsys/logging/Kconfig.filtering:13) was assigned the value
+warning: NET_TCP_TIME_WAIT_DELAY (defined at subsys/net/ip/Kconfig.tcp:48) was assigned the value
+warning: NET_TCP_WORKQ_STACK_SIZE (defined at drivers/wifi/esp32/Kconfig.esp32:44,
+warning: NORDIC_QSPI_NOR (defined at ~/work/cal-clip-firmware/cal-clip-
+warning: PM (defined at soc/silabs/silabs_s2/xg21/Kconfig.defconfig:10,
+warning: THREAD_RUNTIME_STATS (defined at kernel/Kconfig:518) was assigned the value 'n' but got the
+warning: The choice symbol LOG_MODE_MINIMAL (defined at subsys/logging/Kconfig.mode:29) was selected
+warning: The choice symbol MCUBOOT_LOG_LEVEL_INF (defined at
+warning: UART_CONSOLE (defined at drivers/console/Kconfig:42) was assigned the value 'y' but got the

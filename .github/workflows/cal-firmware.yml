@@ -8,6 +8,9 @@ permissions:
 concurrency:
   group: cal-firmware-${{ github.ref }}
   cancel-in-progress: true
+env:
+  # Seeed v0.1.4 (tag v0.1.4). Files added since this commit count as ours in the warning gate.
+  STOCK_BASE: 95db10b0d73529fc239deb34c62d80e5978e83b3
 jobs:
   application:
     name: ${{ matrix.variant }} application
@@ -21,6 +24,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: respeaker_clip
+      - name: CAL tool tests
+        run: python3 -m unittest discover -s respeaker_clip/tools/cal -p 'test_*.py'
       - name: Host tools
         run: |
           sudo apt-get update
@@ -54,26 +59,41 @@ jobs:
           EXTRA=()
           if [[ '${{ matrix.variant }}' == production ]]; then EXTRA=(-DSNIPPET_ROOT="$APP" -DSNIPPET=production); fi
           west build -b clip/nrf5340/cpuapp "$APP" --build-dir build --pristine=always -- "${EXTRA[@]}" 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+      - name: Warning gate (any in our code, or any not in the stock v0.1.4 baseline)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C respeaker_clip fetch --no-tags --depth=1 origin "$STOCK_BASE"
+          ADDED=$(git -C respeaker_clip diff --name-only --diff-filter=A "$STOCK_BASE" HEAD)
+          OURS=(--ours respeaker_clip/applications/clip/)
+          while IFS= read -r f; do if [[ -n $f ]]; then OURS+=(--ours "respeaker_clip/$f"); fi; done <<< "$ADDED"
+          printf 'Owned: applications/clip/ and files added since stock:\n%s\n' "$ADDED"
+          python3 respeaker_clip/tools/cal/warning_gate.py build.log --baseline respeaker_clip/tools/cal/warning-baseline.txt "${OURS[@]}"
       - name: Verify and export application image only
+        id: export
         shell: bash
         run: |
           set -euo pipefail
           APP_IMAGE=ncs/build/clip/zephyr/zephyr.signed.bin
           KEY=respeaker_clip/boards/seeed/clip/sysbuild/root-rsa-2048.pem
           python3 ncs/bootloader/mcuboot/scripts/imgtool.py verify -k "$KEY" "$APP_IMAGE"
-          if grep -E '(^|[[:space:]])warning:' build.log; then exit 1; fi
-          VERSION=$(python3 -c "import sys;sys.path.insert(0,'respeaker_clip/tools/cal');from artifact import inspect_image;print(inspect_image('$APP_IMAGE')['version'])")
+          # Overwrite-only: the image must fit both app slots with its trailer.
+          SLOT=$(python3 -c "import yaml;pm=yaml.safe_load(open('ncs/build/partitions.yml'));print(min(pm['mcuboot_primary']['size'],pm['mcuboot_secondary']['size']))")
+          VERSION=$(python3 -c "import sys;sys.path.insert(0,'respeaker_clip/tools/cal');from artifact import inspect_image;print(inspect_image('$APP_IMAGE', $SLOT)['version'])")
           SHA=$(git -C respeaker_clip rev-parse --short=12 HEAD)
           NAME="clip-${VERSION}-${SHA}-${{ matrix.variant }}"
           mkdir -p output
           cp "$APP_IMAGE" "output/$NAME.signed.bin"
-          python3 respeaker_clip/tools/cal/artifact.py "output/$NAME.signed.bin" --variant '${{ matrix.variant }}' --source-sha '${{ github.sha }}' --output "output/$NAME.json"
-          cp ncs/build/clip/zephyr/.config output/app.config
-          cp build.log output/build.log
+          python3 respeaker_clip/tools/cal/artifact.py "output/$NAME.signed.bin" --variant '${{ matrix.variant }}' \
+            --source-sha "$(git -C respeaker_clip rev-parse HEAD)" --slot-size "$SLOT" --config ncs/build/clip/zephyr/.config \
+            --build-run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --output "output/$NAME.json"
+          cp ncs/build/clip/zephyr/.config "output/$NAME.config"
+          cp ncs/build/partitions.yml "output/$NAME.partitions.yml"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: cal-app-${{ github.sha }}-${{ matrix.variant }}
+          name: ${{ steps.export.outputs.name || format('cal-app-{0}-{1}-incomplete', github.sha, matrix.variant) }}
           path: |
             output/
             build.log

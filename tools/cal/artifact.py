@@ -7,13 +7,16 @@ import struct
 from pathlib import Path
 
 MAGIC = 0x96F3B83D
-SLOT_SIZE = 0xEA000
+SLOT_SIZE = 0xEA000  # mcuboot_primary in boards/seeed/clip/pm_static_clip_nrf5340_cpuapp.yml; CI passes the built value
+# imgtool trailer for overwrite-only mode: max_align * 2 + align_up(16-byte magic, max_align), max_align = 8
+TRAILER_BYTES = 8 * 2 + 16
 
 
-def inspect_image(path):
+def inspect_image(path, slot_bytes=SLOT_SIZE):
     raw = Path(path).read_bytes()
-    if len(raw) < 32 or len(raw) >= SLOT_SIZE - 32:
-        raise ValueError('Application image is truncated or does not fit the existing slot')
+    if len(raw) < 32 or len(raw) + TRAILER_BYTES > slot_bytes:
+        raise ValueError(f'Application image ({len(raw)} B) is truncated or does not fit a {slot_bytes} B slot '
+                         f'with its {TRAILER_BYTES} B trailer')
     magic, _, header, protected, size, flags, major, minor, revision, build, _ = struct.unpack_from('<IIHHIIBBHII', raw)
     if magic != MAGIC or header < 32 or header + size + protected + 4 > len(raw):
         raise ValueError('Invalid MCUboot application header')
@@ -40,7 +43,16 @@ def inspect_image(path):
     return {'file': Path(path).name, 'file_sha256': hashlib.sha256(raw).hexdigest(),
             'image_hash': digest.hex(), 'key_hash': fields[0x01].hex(),
             'version': f'{major}.{minor}.{revision}+{build}', 'bytes': len(raw),
-            'image': 0, 'slot_bytes': SLOT_SIZE}
+            'image': 0, 'slot_bytes': slot_bytes, 'trailer_bytes': TRAILER_BYTES,
+            'free_bytes': slot_bytes - len(raw) - TRAILER_BYTES}
+
+
+def check_variant(config, variant):
+    """The production snippet turns the UART console off; debug keeps it on."""
+    console = 'CONFIG_UART_CONSOLE=y' in Path(config).read_text().splitlines()
+    if console != (variant == 'debug'):
+        raise ValueError(f'{config} has UART console {"on" if console else "off"}, which is not a {variant} build')
+    return console
 
 
 def main():
@@ -49,9 +61,15 @@ def main():
     ap.add_argument('--source-sha', default='')
     ap.add_argument('--variant', choices=['debug', 'production'], required=True)
     ap.add_argument('--output', type=Path, required=True)
+    ap.add_argument('--slot-size', type=lambda v: int(v, 0), default=SLOT_SIZE, help='bytes; read from the build')
+    ap.add_argument('--config', type=Path, help="the application's zephyr/.config, to confirm the variant")
+    ap.add_argument('--build-run', default='')
     args = ap.parse_args()
-    record = inspect_image(args.image)
-    record.update(source_sha=args.source_sha, variant=args.variant, signature_verified_by='MCUboot imgtool in CI')
+    record = inspect_image(args.image, args.slot_size)
+    record.update(source_sha=args.source_sha, variant=args.variant, build_run=args.build_run,
+                  signature_verified_by='MCUboot imgtool in CI')
+    if args.config:
+        record['uart_console'] = check_variant(args.config, args.variant)
     args.output.write_text(json.dumps(record, indent=2) + '\n')
     print(json.dumps(record))
 
