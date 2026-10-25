@@ -49,9 +49,17 @@ and its size follows the MTU in force when it is sent.
 | 10 | sample_rate | u16 | `16000` |
 | 12 | session | u64 | the 14-digit session ID as an integer; format with `%014d` to get the `AT+LIST` ID back |
 
-Firmware 0.1.4+4 always sends kind `0xFF`, because it has no capture-kind
-source yet; the central keeps its own command/note rule. Builds that persist
-the capture kind report `0` or `1`.
+From 0.1.4+5 (tap control plus stream) kind is the capture kind persisted
+for the session: `0` = `"kind":"command"` (button tap, `AT+START=command`),
+`1` = `"note"` (`AT+START`, `AT+START=note`), the same value the `state`
+events, `AT+LIST` and `session.json` report for that session. Firmware
+0.1.4+4 always sends `0xFF`, because it has no capture-kind source; the
+central then keeps its own command/note rule.
+
+`session` is unique and strictly increasing within a boot, and the device
+skips IDs still on its SD card (protocol.md E.2). Across a reset, before the
+central re-syncs the clock (`AT+TIME`), an ID of an already deleted session
+can in principle come back.
 
 ### DATA (type 2), 6 to 244 bytes
 

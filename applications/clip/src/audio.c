@@ -38,6 +38,10 @@
 
 LOG_MODULE_REGISTER(audio, CONFIG_CLIP_LOG_LEVEL);
 
+/* The stream START kind byte is the capture kind itself */
+BUILD_ASSERT(AUDIO_KIND_COMMAND == STREAM_KIND_COMMAND &&
+             AUDIO_KIND_NOTE == STREAM_KIND_NOTE);
+
 /* Memory slab for DMIC buffers */
 K_MEM_SLAB_DEFINE_STATIC(audio_mem_slab, AUDIO_BLOCK_SIZE, 32, 4);
 
@@ -755,9 +759,9 @@ void audio_recording_thread(void *p1, void *p2, void *p3)
             continue;
         }
 
-        /* Live stream of this session's records (kind: the tap-control
-         * build supplies the persisted capture kind). */
-        stream_begin(current_session_id, STREAM_KIND_UNSPECIFIED,
+        /* Live stream of this session's records. START carries the same
+         * capture kind as session.json and the state events. */
+        stream_begin(current_session_id, (uint8_t)current_kind,
                      (uint8_t)opus_channels);
 
         /* Recording loop - process audio until stop requested */

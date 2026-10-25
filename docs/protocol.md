@@ -2719,7 +2719,7 @@ The driver checks `debounce-ms` on 30 ms polls, so a press still down at the sec
 2. At 8 s the device stops any recording through the same settled path as a tap (the session is closed first), shows the power-off screen, buzzes twice and enters ship mode. Releasing the button afterwards does nothing.
 3. **Charging (USB power):** the 8 s power-off is refused (the PMIC cannot enter ship mode with USB power), with no buzz or screen. Release before about 7 s to see the status bar. While the nPM1300 long-press reset is on (default build, `lp_reset: true` in `AT+GSTAT`), holding longer power-cycles the Clip. It restarts with the button still down and USB present, so MCUboot enters USB serial recovery: the OLED shows "Recovery Mode", there is no BLE and the relay goes offline. Holding again on USB goes back into recovery. To get out, unplug USB and hold the button until the Clip resets, or send an mcumgr `reset` over the recovery serial port. Whether it charges while in recovery is not yet bench-checked (MCUboot disables the charger driver).
 
-> **Bench build caveat (0.1.4+3):** the nPM1300 long-press hard reset (button = SHPHLD, about 7 s) is still enabled by default, so an 8 s hold can end in a PMIC power cycle at about 7 s (Seeed; 10 s nominal per the nPM1300 spec) instead of the graceful shutdown; on USB power it ends in MCUboot serial recovery instead (item 3). That reset bypasses the recording close: an open recording may lose its tail. The app disables the PMIC reset only with `CONFIG_CLIP_PMIC_LONG_PRESS_RESET_DISABLE=y`, after the hardware watchdog has started, and reports the result as `lp_reset` in `AT+GSTAT`. That option stays off until watchdog recovery is proven on hardware.
+> **Bench build caveat (0.1.4+3 and later):** the nPM1300 long-press hard reset (button = SHPHLD, about 7 s) is still enabled by default, so an 8 s hold can end in a PMIC power cycle at about 7 s (Seeed; 10 s nominal per the nPM1300 spec) instead of the graceful shutdown; on USB power it ends in MCUboot serial recovery instead (item 3). That reset bypasses the recording close: an open recording may lose its tail. The app disables the PMIC reset only with `CONFIG_CLIP_PMIC_LONG_PRESS_RESET_DISABLE=y`, after the hardware watchdog has started, and reports the result as `lp_reset` in `AT+GSTAT`. That option stays off until watchdog recovery is proven on hardware.
 
 ### E.4 Watchdog
 
@@ -2735,6 +2735,8 @@ Button actions that change state send unsolicited notifications:
 |--------|-------------|
 | Start recording (capture ready) | `{"event":"state","state":"RECORDING","session":"...","kind":"command"}` |
 | Stop recording (session closed) | `{"event":"state","state":"IDLE","session":"...","kind":"command","duration":N,"frames":N}` |
+
+`kind` is `command` for a button tap (or `AT+START=command`) and `note` for `AT+START` / `AT+START=note`; it is persisted in `session.json` and `AT+LIST`. From 0.1.4+5 the live stream's START packet carries the same kind as a number (`0` command, `1` note; [stream_protocol.md](stream_protocol.md)).
 
 
 ## Appendix F: Extending the Protocol — Adding a New AT Command
