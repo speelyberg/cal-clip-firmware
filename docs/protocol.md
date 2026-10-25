@@ -215,6 +215,22 @@ space and 4 hex digits of the nRF5340 FICR DEVICEID low 16 bits (e.g.
   the owner must send `AT+PAIR=reset` first (this also erases the SD card).
   USB is not a separate way in: the app's USB CDC port only appears after
   `AT+USB=on`, which itself needs the encrypted owner link.
+- **Stock debug image migration:** Zephyr stores the overwrite-oldest
+  setting with each bond and deletes the bond at boot when it differs from
+  the running build. The official debug image (and the 0.1.4+1 canary debug
+  build) has `CONFIG_BT_KEYS_OVERWRITE_OLDEST=y`; every later CAL build, and
+  the official production image, has `n`. So the first boot after an upgrade
+  from the official debug image to any CAL build, or after a rollback to it,
+  deletes the bond once, with no log line, and the first central that pairs
+  becomes the owner. Before that reset, turn Bluetooth off on every other
+  central that knows the Clip (Mac, phone). Right after it boots, remove the
+  stale bond on the owner's side so it pairs fresh (BlueZ:
+  `bluetoothctl`, `select <owner controller>`, `remove <clip address>`);
+  the owner then pairs on its next connect. The Clip advertises after boot;
+  on a CAL build a hold of about 2 s, released, restarts fast advertising
+  without recording (a tap would start one).
+  Moves between the official production image and CAL builds, and between
+  CAL debug and production, keep the bond.
 - **Owner lost** (the bonded central is gone, e.g. a replaced dongle): no
   other central can pair, and BLE OTA (SMP needs encryption) and
   `AT+PAIR=reset` are unreachable. Recover through MCUboot serial recovery:
@@ -2719,13 +2735,13 @@ The driver checks `debounce-ms` on 30 ms polls, so a press still down at the sec
 2. At 8 s the device stops any recording through the same settled path as a tap (the session is closed first), shows the power-off screen, buzzes twice and enters ship mode. Releasing the button afterwards does nothing.
 3. **Charging (USB power):** the 8 s power-off is refused (the PMIC cannot enter ship mode with USB power), with no buzz or screen. Release before about 7 s to see the status bar. While the nPM1300 long-press reset is on (default build, `lp_reset: true` in `AT+GSTAT`), holding longer power-cycles the Clip. It restarts with the button still down and USB present, so MCUboot enters USB serial recovery: the OLED shows "Recovery Mode", there is no BLE and the relay goes offline. Holding again on USB goes back into recovery. To get out, unplug USB and hold the button until the Clip resets, or send an mcumgr `reset` over the recovery serial port. Whether it charges while in recovery is not yet bench-checked (MCUboot disables the charger driver).
 
-> **Bench build caveat (0.1.4+3 and later):** the nPM1300 long-press hard reset (button = SHPHLD, about 7 s) is still enabled by default, so an 8 s hold can end in a PMIC power cycle at about 7 s (Seeed; 10 s nominal per the nPM1300 spec) instead of the graceful shutdown; on USB power it ends in MCUboot serial recovery instead (item 3). That reset bypasses the recording close: an open recording may lose its tail. The app disables the PMIC reset only with `CONFIG_CLIP_PMIC_LONG_PRESS_RESET_DISABLE=y`, after the hardware watchdog has started, and reports the result as `lp_reset` in `AT+GSTAT`. That option stays off until watchdog recovery is proven on hardware.
+> **Bench build caveat (0.1.4+3 and later):** the nPM1300 long-press hard reset (button = SHPHLD, about 7 s) is still enabled by default, so an 8 s hold can end in a PMIC power cycle at about 7 s (Seeed; 10 s nominal per the nPM1300 spec) instead of the graceful shutdown; on USB power it ends in MCUboot serial recovery instead (item 3). That reset bypasses the recording close. The open segment file is synced to the SD card about every 5 s of audio, so it keeps everything up to the last sync and loses at most the last ~5 s (unsynced data); with the reset about 7 s into the hold, the loss falls inside the hold and speech before the press is kept. The session is never closed, so `session.json` keeps the duration written at start, and a live stream gets no END (the relay downloads the file instead). The app disables the PMIC reset only with `CONFIG_CLIP_PMIC_LONG_PRESS_RESET_DISABLE=y`, after the hardware watchdog has started, and reports the result as `lp_reset` in `AT+GSTAT`. That option stays off until watchdog recovery is proven on hardware.
 
 ### E.4 Watchdog
 
 The application starts the nRF5340 hardware watchdog (WDT0, `CONFIG_CLIP_WDT_TIMEOUT_MS`, default 30 s) just before its main event loop. Only that loop feeds it, and only while the audio thread is settled or still making progress, so a hung event loop or a stuck recording resets the device. The watchdog keeps running across a soft reset (OTA reboot, `AT+REBOOT`, `AT+DFU`); MCUboot feeds it during an image copy and in serial recovery. An application that never feeds it (for example after rolling back to an official image by OTA) is reset once, about 30 s after it boots; the watchdog reset itself stops the watchdog.
 
-Bench check (`CONFIG_CLIP_WDT_TEST`, debug builds only; the production snippet turns it off): `AT+WDTTEST=loop` hangs the event loop right after one last feed; `AT+WDTTEST=audio` hangs the audio thread of a running recording (otherwise `"Invalid state"`, also when the watchdog is not running). Reply `{"ok":true}`; the watchdog must then reset the device about 30 s later (29–31 s). A hung recording is not closed: expect its tail to be lost.
+Bench check (`CONFIG_CLIP_WDT_TEST`, debug builds only; the production snippet turns it off): `AT+WDTTEST=loop` hangs the event loop right after one last feed; `AT+WDTTEST=audio` hangs the audio thread of a running recording (otherwise `"Invalid state"`, also when the watchdog is not running). Reply `{"ok":true}`; the watchdog must then reset the device about 30 s later (29–31 s). A hung recording is not closed: its file keeps what was synced before the hang, so at most the last ~5 s before the hang are lost, and nothing is recorded during the hang. A brown-out or any other reset during a recording likewise loses at most the last ~5 s.
 
 ### E.5 State Change Notifications
 

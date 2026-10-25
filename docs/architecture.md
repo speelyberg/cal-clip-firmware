@@ -432,7 +432,7 @@ The timestamp-bucket layout is the only supported on-card recording format.
 `AT+LIST`, `AT+DOWNLOAD`, and `AT+DELETE` continue to use the complete 14-digit
 session ID; old `/SD:/REC/<session_id>/` directories are not read.
 
-**Write Buffer**: 4KB buffered writes (`CONFIG_CLIP_STORAGE_CHUNK_SIZE=4096`) for efficient SD card I/O.
+**Write Buffer**: 4KB buffered writes (`CONFIG_CLIP_STORAGE_CHUNK_SIZE=4096`) for efficient SD card I/O. Every 5th flush (~5 s at 32 kbps) also syncs the open segment (`fs_sync`), because FatFs records the file's size in its directory entry only on sync or close: a reset during a recording loses at most the last ~5 s instead of the whole open segment. Each file close logs the longest of those syncs (`sync max N ms`); the 32-block DMIC queue absorbs stalls up to 640 ms.
 
 **Session Lifecycle**: `storage_create_session()` -> `storage_create_file()` -> `storage_write_frame()` -> `storage_close_file()` -> `storage_close_session()`
 
