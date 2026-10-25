@@ -38,6 +38,7 @@ the only maintained translation is `tests/clip/README_zh.md`.
 
 - [protocol.md](protocol.md) — BLE AT command protocol (WiFi AP credentials, AT command list in Appendix A)
 - [udp_protocol.md](udp_protocol.md) — WiFi UDP file transfer protocol
+- [stream_protocol.md](stream_protocol.md) — live Opus stream over BLE (START/DATA/END, file fallback)
 
 **Reference**
 

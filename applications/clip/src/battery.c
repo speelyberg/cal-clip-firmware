@@ -810,9 +810,9 @@ int battery_init(void)
 		/* Continue with basic battery monitoring */
 	} else {
 		/* Print initial readings (sensor convention: I negative = discharging) */
-		LOG_INF("init: V=%.3f I=%.3f T=%.1f chg=0x%02x",
-			init_params.v0, init_params.i0, init_params.t0,
-			(unsigned int)chg_status);
+		LOG_INF("init: V=%dmV I=%dmA T=%dC chg=0x%02x",
+			(int)(init_params.v0 * 1000.f), (int)(init_params.i0 * 1000.f),
+			(int)init_params.t0, (unsigned int)chg_status);
 
 		/* Zephyr sensor API: negative = discharging; nrf_fuel_gauge expects
 		 * negative = charging -- negate i0 so the fuel gauge starts correct. */
@@ -836,8 +836,8 @@ int battery_init(void)
 		    (int)voltage_soc_estimate(init_params.v0) -
 			    (int)fg_state_record.displayed_soc >=
 			    BATTERY_DISPLAY_REANCHOR_THRESHOLD) {
-			LOG_WRN("stale fg state: %.3fV vs seed %u%% -> new estimate",
-				init_params.v0,
+			LOG_WRN("stale fg state: %dmV vs seed %u%% -> new estimate",
+				(int)(init_params.v0 * 1000.f),
 				(unsigned int)fg_state_record.displayed_soc);
 			fg_state_loaded = false;
 			init_params.state = NULL;

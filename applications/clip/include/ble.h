@@ -144,6 +144,22 @@ int ble_clear_bonds(void);
 struct bt_conn *ble_get_connection(void);
 
 /**
+ * @brief Take a reference to the current connection (caller unrefs)
+ *
+ * @return Referenced connection, or NULL if not connected
+ */
+struct bt_conn *ble_conn_ref(void);
+
+/**
+ * @brief Send one live-stream packet (docs/stream_protocol.md)
+ *
+ * May block the calling thread until an ATT buffer is free.
+ *
+ * @return 0 on success, negative error code on failure
+ */
+int ble_stream_notify(struct bt_conn *conn, const uint8_t *data, uint16_t len);
+
+/**
  * @brief Get negotiated ATT MTU
  *
  * @param conn Connection pointer

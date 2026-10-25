@@ -118,6 +118,17 @@ static int build_transfer_path(char *buf, size_t size, const char *session_id,
 	return storage_build_chunk_path(session_id, file_num, buf, size);
 }
 
+/* True while this session is still being captured (starting, recording,
+ * paused or stopping). audio_get_session_id() keeps the last ID after the
+ * capture settles, so comparing IDs alone made every download of the newest
+ * finished session "continuous" and wait out the end-of-recording poll. */
+static bool session_is_live(const char *session_id)
+{
+    const char *rec = audio_get_session_id();
+
+    return audio_is_recording() && rec != NULL && strcmp(rec, session_id) == 0;
+}
+
 /**
  * @brief Generate filename from file number
  *
@@ -283,9 +294,7 @@ int transfer_start(const char *session_id, const char *filename, struct transpor
         current_transfer.last_file_num = session_info.file_count;
 
         /* Check if this session is currently being recorded (continuous mode) */
-        const char *recording_session = audio_get_session_id();
-        current_transfer.continuous = (recording_session != NULL &&
-                                       strcmp(recording_session, session_id) == 0);
+        current_transfer.continuous = session_is_live(session_id);
 
         /* For continuous mode, total files unknown until recording stops */
         if (current_transfer.continuous) {
@@ -404,9 +413,7 @@ int transfer_resume_from(const char *session_id, const char *start_file, struct 
     current_transfer.last_file_num = session_info.file_count;
 
     /* Check if this session is currently being recorded (continuous mode) */
-    const char *recording_session = audio_get_session_id();
-    current_transfer.continuous = (recording_session != NULL &&
-                                   strcmp(recording_session, session_id) == 0);
+    current_transfer.continuous = session_is_live(session_id);
 
     /* Extract number from filename (e.g., "0023.opus" -> 23) */
     int start_num = atoi(start_file);
@@ -978,14 +985,19 @@ static int transfer_next_file(void)
             /* File doesn't exist yet - wait for it (recording in progress) */
             int wait_count = 0;
             while (wait_count < 600) {  /* Wait up to 5 minutes (600 * 500ms) */
+                /* Sampled before the stat: a file created before the
+                 * capture settled is visible below */
+                bool live = session_is_live(current_transfer.session_id);
+
                 /* Check if file appeared */
                 if (fs_stat(filepath, &entry) == 0) {
                     LOG_INF("Found new file: %s", current_transfer.current_file);
                     goto wait_for_write;
                 }
 
-                /* Check if recording stopped - if so, no more files coming */
-                if (!audio_is_recording() && wait_count > 4) {
+                /* Capture settled (files closed) or another session is
+                 * recording: no more files are coming for this one */
+                if (!live) {
                     /* Check if next file exists (skip missing files) */
                     uint32_t next_num = file_num + 1;
                     char next_name[16];

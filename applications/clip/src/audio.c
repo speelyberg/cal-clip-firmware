@@ -27,6 +27,7 @@
 
 #include "audio.h"
 #include "haptic.h"
+#include "stream.h"
 #include "clip.h"
 #include "config.h"
 #include "storage.h"
@@ -754,6 +755,11 @@ void audio_recording_thread(void *p1, void *p2, void *p3)
             continue;
         }
 
+        /* Live stream of this session's records (kind: the tap-control
+         * build supplies the persisted capture kind). */
+        stream_begin(current_session_id, STREAM_KIND_UNSPECIFIED,
+                     (uint8_t)opus_channels);
+
         /* Recording loop - process audio until stop requested */
         while (!stop_requested) {
             atomic_inc(&heartbeat);
@@ -943,6 +949,9 @@ void audio_recording_thread(void *p1, void *p2, void *p3)
                 calculate_energy_level(pcm_data, AUDIO_OPUS_FRAME_SIZE);
             }
 
+            /* Same record to the live stream (copy only, never waits) */
+            stream_push(opus_packet, (uint16_t)encoded_bytes);
+
             /* Write encoded data to storage (with 2-byte length header) */
             if (current_storage_file.is_open) {
                 ret = storage_write_frame(&current_storage_file, opus_packet, encoded_bytes);
@@ -1022,6 +1031,10 @@ create_new_segment:
 
             k_yield();
         }
+
+        /* Every captured record is in the stream: END may go out before
+         * the slow SD close below. IDLE still marks the file settled. */
+        stream_end();
 
         /* Perform cleanup in audio thread context */
         audio_stop_recording_internal();
