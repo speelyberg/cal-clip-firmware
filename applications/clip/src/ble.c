@@ -21,6 +21,7 @@
 #include "display.h"
 #include "config.h"
 #include "clip_event.h"
+#include "stream.h"
 
 LOG_MODULE_REGISTER(ble, CONFIG_CLIP_LOG_LEVEL);
 
@@ -62,6 +63,10 @@ static const struct bt_uuid_128 file_data_uuid = BT_UUID_INIT_128(
 /* Audio Visualization UUID: 6E400005-B5A3-F393-E0A9-E50E24DCCA9E */
 static const struct bt_uuid_128 audio_vis_uuid = BT_UUID_INIT_128(
     BT_UUID_128_ENCODE(0x6E400005, 0xB5A3, 0xF393, 0xE0A9, 0xE50E24DCCA9E));
+
+/* Live Opus stream UUID: 6E400006-B5A3-F393-E0A9-E50E24DCCA9E */
+static const struct bt_uuid_128 stream_uuid = BT_UUID_INIT_128(
+    BT_UUID_128_ENCODE(0x6E400006, 0xB5A3, 0xF393, 0xE0A9, 0xE50E24DCCA9E));
 
 /* Advertising data - dynamically built */
 static struct bt_data ad[2];
@@ -226,6 +231,7 @@ static ssize_t cmd_recv_write(struct bt_conn *conn,
 static void resp_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value);
 static void file_data_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value);
 static void audio_vis_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value);
+static void stream_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value);
 
 /* GATT service definition */
 BT_GATT_SERVICE_DEFINE(clip_svc,
@@ -261,6 +267,16 @@ BT_GATT_SERVICE_DEFINE(clip_svc,
                            NULL, NULL, NULL),
     BT_GATT_CCC(audio_vis_ccc_cfg_changed,
                 BT_GATT_PERM_READ | BT_GATT_PERM_WRITE_ENCRYPT),
+
+    /* Live Opus stream (Notify), docs/stream_protocol.md. Appended last so
+     * the attrs[] indexes above stay put; READ_ENCRYPT makes the stack
+     * refuse to notify it over an unencrypted link. */
+    BT_GATT_CHARACTERISTIC(&stream_uuid.uuid,
+                           BT_GATT_CHRC_NOTIFY,
+                           BT_GATT_PERM_READ_ENCRYPT,
+                           NULL, NULL, NULL),
+    BT_GATT_CCC(stream_ccc_cfg_changed,
+                BT_GATT_PERM_READ | BT_GATT_PERM_WRITE_ENCRYPT),
 );
 
 /* CCC callback */
@@ -291,6 +307,11 @@ static void audio_vis_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t 
 {
     ble_ctx.audio_vis_notify_enabled = (value & BT_GATT_CCC_NOTIFY);
     LOG_DBG("Audio vis notify: %d", ble_ctx.audio_vis_notify_enabled);
+}
+
+static void stream_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t value)
+{
+    stream_set_subscribed(value & BT_GATT_CCC_NOTIFY);
 }
 
 /* Generate device name from FICR device ID */
@@ -450,6 +471,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
         ble_ctx.notify_enabled = false;
         ble_ctx.file_data_notify_enabled = false;
         ble_ctx.audio_vis_notify_enabled = false;
+        stream_set_subscribed(false);
 
         /* Cancel security timeout */
         k_work_cancel_delayable(&security_timeout_work);
@@ -934,6 +956,29 @@ int ble_clear_bonds(void)
 struct bt_conn *ble_get_connection(void)
 {
     return ble_ctx.conn;
+}
+
+struct bt_conn *ble_conn_ref(void)
+{
+    struct bt_conn *conn = NULL;
+
+    /* disconnected() (BT RX thread) unrefs and clears ble_ctx.conn; with
+     * the scheduler locked it cannot run between the read and the ref. */
+    k_sched_lock();
+    if (ble_ctx.conn) {
+        conn = bt_conn_ref(ble_ctx.conn);
+    }
+    k_sched_unlock();
+    return conn;
+}
+
+int ble_stream_notify(struct bt_conn *conn, const uint8_t *data, uint16_t len)
+{
+    /* A streamed recording keeps the link out of the inactivity timeout */
+    ble_activity_refresh();
+
+    /* Stream characteristic value is at attrs[13] */
+    return bt_gatt_notify(conn, &clip_svc.attrs[13], data, len);
 }
 
 uint16_t ble_get_mtu(struct bt_conn *conn)
