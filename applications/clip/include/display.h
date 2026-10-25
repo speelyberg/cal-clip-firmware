@@ -41,6 +41,7 @@ enum ui_state {
 	UI_STATE_LOW_BATTERY,          /**< Low battery warning */
 	UI_STATE_WIFI_BLOCKED,         /**< WiFi active, cannot record */
 	UI_STATE_USB_BLOCKED,          /**< USB MSC active, cannot record */
+	UI_STATE_BOOT_LOGO,            /**< CAL splash during startup */
 };
 
 /* =============================================================================
@@ -75,6 +76,7 @@ enum ui_event {
 	UI_EVENT_WIFI_BLOCKED,         /**< WiFi active, cannot record */
 	UI_EVENT_USB_BLOCKED,          /**< USB MSC active, cannot record */
 	UI_EVENT_ANIM_TICK,            /**< Animation frame tick (internal) */
+	UI_EVENT_BOOT_LOGO,            /**< Show CAL splash on the display thread */
 };
 
 /* =============================================================================
