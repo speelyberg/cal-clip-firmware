@@ -149,6 +149,10 @@ const char *clip_state_to_string(enum clip_state state);
 /* Hardware watchdog running (main.c) */
 bool clip_wdt_running(void);
 
+/* Bench watchdog test (AT+WDTTEST, CONFIG_CLIP_WDT_TEST): 1 hangs the event
+ * loop, 2 hangs the audio thread of a running recording; 0 = normal */
+extern atomic_t clip_wdt_hang;
+
 /* nPM1300 long-press reset turned off and read back (main.c); false = the
  * ~7 s PMIC hard reset still precedes the 8 s graceful power-off */
 bool clip_pmic_lp_reset_off(void);

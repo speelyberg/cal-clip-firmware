@@ -732,6 +732,10 @@ void audio_recording_thread(void *p1, void *p2, void *p3)
         /* Recording loop - process audio until stop requested */
         while (!stop_requested) {
             atomic_inc(&heartbeat);
+            if (atomic_get(&clip_wdt_hang) == 2) {
+                LOG_ERR("WDTTEST: audio thread hung");
+                k_sleep(K_FOREVER);
+            }
 
             /* Check for pause request */
             if (pause_requested) {

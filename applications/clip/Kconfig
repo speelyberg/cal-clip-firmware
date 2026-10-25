@@ -125,6 +125,15 @@ config CLIP_PMIC_LONG_PRESS_RESET_DISABLE
 	  hangs recover, recovery to MCUboot proven); until then an 8 s hold
 	  may end in the PMIC hard reset instead of a graceful shutdown.
 
+config CLIP_WDT_TEST
+	bool "AT+WDTTEST bench hook (hang the event loop or the audio thread)"
+	default y
+	help
+	  Bench check of the watchdog: AT+WDTTEST=loop hangs the main event
+	  loop, AT+WDTTEST=audio hangs the audio thread of a running
+	  recording; the watchdog must then reset the device. On while the
+	  watchdog hardware gate is open; turn it off for a shipped image.
+
 config CLIP_SD_IDLE_DELAY_MS
 	int "SD card idle power-off delay (ms)"
 	default 45000

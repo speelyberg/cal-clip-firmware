@@ -16,6 +16,8 @@
 
 LOG_MODULE_REGISTER(at_server, CONFIG_CLIP_LOG_LEVEL);
 
+#define AT_MAX_COMMANDS 40   /* 32 were all but used (31) */
+
 /* Command queue item */
 struct at_queue_item {
     uint8_t data[CONFIG_CLIP_AT_MAX_CMD_LEN];
@@ -37,7 +39,7 @@ static struct {
 
 /* Command registry */
 static struct {
-    const struct at_command *cmds[32];
+    const struct at_command *cmds[AT_MAX_COMMANDS];
     int count;
 } cmd_registry = { .count = 0 };
 
@@ -51,7 +53,7 @@ int at_server_register_cmd(const struct at_command *cmd)
         return -EINVAL;
     }
 
-    if (cmd_registry.count >= 32) {
+    if (cmd_registry.count >= AT_MAX_COMMANDS) {
         return -ENOMEM;
     }
 

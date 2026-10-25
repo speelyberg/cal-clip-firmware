@@ -331,6 +331,7 @@ int clip_init(void)
  * and a stuck capture both end in a reset. Not fed from a timer. */
 static const struct device *const wdt_dev = DEVICE_DT_GET(DT_NODELABEL(wdt0));
 static int wdt_channel = -1;
+atomic_t clip_wdt_hang;
 static bool lp_reset_off;       /* nPM1300 long-press reset off (read back) */
 
 /* nPM1300 SHIP registers (npmx npm1300.h; Zephyr mfd_npm13xx.c) */
@@ -446,6 +447,10 @@ void clip_main_loop(void)
 
         /* Process all pending events */
         clip_event_process();
+        if (atomic_get(&clip_wdt_hang) == 1) {
+            LOG_ERR("WDTTEST: event loop hung");
+            k_sleep(K_FOREVER);
+        }
         clip_wdt_feed();
 
         /* Update recording time if recording */

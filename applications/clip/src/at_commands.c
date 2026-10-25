@@ -657,6 +657,27 @@ static int cmd_haptic_handler(struct at_cmd_ctx *ctx, char *response, size_t len
     return -AT_ERR_PARAM;
 }
 
+#ifdef CONFIG_CLIP_WDT_TEST
+/* WDTTEST - bench check of the watchdog: AT+WDTTEST=loop hangs the event
+ * loop (at its next wake, <= CONFIG_CLIP_WDT_TIMEOUT_MS/4), AT+WDTTEST=audio
+ * the audio thread of a running recording. The watchdog must then reset the
+ * device within CONFIG_CLIP_WDT_TIMEOUT_MS. */
+static int cmd_wdttest_handler(struct at_cmd_ctx *ctx, char *response, size_t len)
+{
+    int which = !ctx->args ? 0 : strcmp(ctx->args, "loop") == 0 ? 1
+              : strcmp(ctx->args, "audio") == 0 ? 2 : 0;
+
+    if (which == 0) {
+        return -AT_ERR_PARAM;
+    }
+    if (!clip_wdt_running() || (which == 2 && !audio_is_capturing())) {
+        return -AT_ERR_STATE;
+    }
+    atomic_set(&clip_wdt_hang, which);
+    return create_json_response(true, NULL, NULL, response, len);
+}
+#endif
+
 /* POWEROFF Command Handler - Shutdown the device */
 static int cmd_poweroff_handler(struct at_cmd_ctx *ctx, char *response, size_t len)
 {
@@ -2092,6 +2113,17 @@ int at_commands_register(void)
     };
     err = at_server_register_cmd(&haptic_cmd);
     if (err) return err;
+
+#ifdef CONFIG_CLIP_WDT_TEST
+    /* WDTTEST - bench watchdog check (AT+WDTTEST=loop|audio) */
+    static const struct at_command wdttest_cmd = {
+        .name = "WDTTEST",
+        .flags = AT_CMD_SET,
+        .handler = cmd_wdttest_handler,
+    };
+    err = at_server_register_cmd(&wdttest_cmd);
+    if (err) return err;
+#endif
 
     /* LOG - control FS (SD) log backend (AT+LOG=off|info|debug) */
     static const struct at_command log_cmd = {

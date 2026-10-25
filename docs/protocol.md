@@ -2703,6 +2703,8 @@ Presses shorter than 50 ms are ignored (bounce or glitch). There is no double-cl
 
 The application starts the nRF5340 hardware watchdog (WDT0, `CONFIG_CLIP_WDT_TIMEOUT_MS`, default 30 s) just before its main event loop. Only that loop feeds it, and only while the audio thread is settled or still making progress, so a hung event loop or a stuck recording resets the device. The watchdog keeps running across a soft reset (OTA reboot, `AT+REBOOT`, `AT+DFU`); MCUboot feeds it during an image copy and in serial recovery. An application that never feeds it (for example after rolling back to an official image by OTA) is reset once, about 30 s after it boots; the watchdog reset itself stops the watchdog.
 
+Bench check (`CONFIG_CLIP_WDT_TEST`, on in 0.1.4+3, off for a shipped image): `AT+WDTTEST=loop` hangs the event loop at its next wake (within 7.5 s idle, 1 s while recording); `AT+WDTTEST=audio` hangs the audio thread of a running recording (otherwise `"Invalid state"`, also when the watchdog is not running). Reply `{"ok":true}`; the watchdog must then reset the device within 30 s. A hung recording is not closed: expect its tail to be lost.
+
 ### E.5 State Change Notifications
 
 Button actions that change state send unsolicited notifications:
