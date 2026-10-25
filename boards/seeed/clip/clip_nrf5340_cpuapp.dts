@@ -16,9 +16,16 @@
 		compatible = "gpio-button";
 		gpios = <&gpio1 15 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
 		label = "USR";
-		debounce-ms = <30>;
-		long-press-ms = <1000 3000>;
-		double-click-ms = <200>;
+		/* Tap-to-toggle: a press of 50 ms..1 s toggles recording (on
+		 * release; 50 ms = seen pressed on two 30 ms polls, so a motor/
+		 * EMI glitch can't toggle). 1 s marks a hold, which never
+		 * toggles; 8 s powers off. No double-click (0 = no wait: the
+		 * tap is reported ~30 ms after release). The nPM1300 long-press
+		 * reset (~7 s, SHPHLD) still fires first unless the app has
+		 * CONFIG_CLIP_PMIC_LONG_PRESS_RESET_DISABLE. */
+		debounce-ms = <50>;
+		long-press-ms = <1000 8000>;
+		double-click-ms = <0>;
 		status = "okay";
 	};
 

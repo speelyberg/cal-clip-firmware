@@ -74,7 +74,7 @@ static bool capture_quiet(void)
 	enum clip_state state = clip_event_get_state();
 
 	return state != CLIP_STATE_RECORDING && state != CLIP_STATE_PAUSED &&
-	       !audio_capture_busy();
+	       !audio_is_recording();
 }
 
 static int haptic_enqueue(enum haptic_pattern pattern, bool feedback)

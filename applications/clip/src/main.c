@@ -9,6 +9,8 @@
 #include <zephyr/logging/log_backend.h>
 #include <zephyr/logging/log_ctrl.h>
 #include <zephyr/drivers/regulator.h>
+#include <zephyr/drivers/watchdog.h>
+#include <zephyr/drivers/mfd/npm13xx.h>
 #include <app_version.h>
 #include <zephyr/sys/util.h>
 #include <zephyr/sys/mem_stats.h>
@@ -324,6 +326,84 @@ int clip_init(void)
     return 0;
 }
 
+/* Hardware watchdog: fed by the main event loop only, and only while the
+ * audio thread is settled or still making progress, so a dead event thread
+ * and a stuck capture both end in a reset. Not fed from a timer. */
+static const struct device *const wdt_dev = DEVICE_DT_GET(DT_NODELABEL(wdt0));
+static int wdt_channel = -1;
+static bool lp_reset_off;       /* nPM1300 long-press reset off (read back) */
+
+/* nPM1300 SHIP registers (npmx npm1300.h; Zephyr mfd_npm13xx.c) */
+#define NPM_SHIP_BASE      0x0BU
+#define NPM_SHIP_CFGSTROBE 0x01U    /* TASKSHPHLDCFGSTROBE: apply config */
+#define NPM_SHIP_LPCONFIG  0x06U    /* LPRESETCONFIG, bit 0 LONGTIMRESETDIS */
+
+static void pmic_long_press_reset_disable(void)
+{
+    const struct device *pmic = DEVICE_DT_GET(DT_NODELABEL(npm1300));
+    uint8_t v = 0;
+    int err = mfd_npm13xx_reg_write(pmic, NPM_SHIP_BASE, NPM_SHIP_LPCONFIG, 1U);
+
+    if (!err) {
+        err = mfd_npm13xx_reg_write(pmic, NPM_SHIP_BASE, NPM_SHIP_CFGSTROBE, 1U);
+    }
+    if (!err) {
+        err = mfd_npm13xx_reg_read(pmic, NPM_SHIP_BASE, NPM_SHIP_LPCONFIG, &v);
+    }
+    lp_reset_off = !err && (v & 1U);
+    if (!lp_reset_off) {
+        /* Not confirmed: put the stock reset back */
+        (void)mfd_npm13xx_reg_write(pmic, NPM_SHIP_BASE, NPM_SHIP_LPCONFIG, 0U);
+        (void)mfd_npm13xx_reg_write(pmic, NPM_SHIP_BASE, NPM_SHIP_CFGSTROBE, 1U);
+    }
+    LOG_WRN("PMIC long-press reset %s (%d, 0x%02x)", lp_reset_off ? "OFF" : "kept", err, v);
+}
+
+static void clip_wdt_start(void)
+{
+    const struct wdt_timeout_cfg cfg = {
+        .window.max = CONFIG_CLIP_WDT_TIMEOUT_MS,
+        .flags = WDT_FLAG_RESET_SOC,
+    };
+    int err = device_is_ready(wdt_dev) ? wdt_install_timeout(wdt_dev, &cfg) : -ENODEV;
+
+    if (err >= 0) {
+        wdt_channel = err;
+        /* Runs in sleep too: the idle loop wakes to feed it */
+        err = wdt_setup(wdt_dev, WDT_OPT_PAUSE_HALTED_BY_DBG);
+    }
+    if (err < 0) {
+        wdt_channel = -1;
+        LOG_ERR("watchdog %d: PMIC reset kept", err);
+        return;
+    }
+    LOG_INF("watchdog %d ms", CONFIG_CLIP_WDT_TIMEOUT_MS);
+    if (IS_ENABLED(CONFIG_CLIP_PMIC_LONG_PRESS_RESET_DISABLE)) {
+        pmic_long_press_reset_disable();
+    }
+}
+
+static void clip_wdt_feed(void)
+{
+    static uint32_t last_hb;
+    uint32_t hb = audio_heartbeat();
+
+    if (wdt_channel >= 0 && (!audio_is_recording() || hb != last_hb)) {
+        wdt_feed(wdt_dev, wdt_channel);
+    }
+    last_hb = hb;
+}
+
+bool clip_wdt_running(void)
+{
+    return wdt_channel >= 0;
+}
+
+bool clip_pmic_lp_reset_off(void)
+{
+    return lp_reset_off;
+}
+
 extern struct k_heap _system_heap;
 
 static void thread_stack_stats_cb(const struct k_thread *thread, void *user_data)
@@ -354,14 +434,15 @@ void clip_main_loop(void)
     int stats_counter = 0;
 
     while (true) {
-        /* Use K_FOREVER when not recording to allow deep idle;
-         * use 1s timeout during recording for time tracking */
+        /* 1 s during recording for time tracking; bounded when idle too,
+         * because this loop is what feeds the watchdog */
         k_timeout_t wait = (clip_event_get_state() == CLIP_STATE_RECORDING)
-                           ? K_MSEC(1000) : K_FOREVER;
+                           ? K_MSEC(1000) : K_MSEC(CONFIG_CLIP_WDT_TIMEOUT_MS / 4);
         clip_event_wait(wait);
 
         /* Process all pending events */
         clip_event_process();
+        clip_wdt_feed();
 
         /* Update recording time if recording */
         if (clip_event_get_state() == CLIP_STATE_RECORDING) {
@@ -426,6 +507,9 @@ int main(void)
         LOG_ERR("Application init failed: %d", err);
         return err;
     }
+
+    /* Watchdog only once init succeeded: a failing init must not reset-loop */
+    clip_wdt_start();
 
     /* Enter main loop */
     clip_main_loop();

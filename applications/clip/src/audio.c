@@ -32,6 +32,7 @@
 #include "transfer.h"
 #include "ble.h"
 #include "display.h"
+#include "clip_event.h"
 
 LOG_MODULE_REGISTER(audio, CONFIG_CLIP_LOG_LEVEL);
 
@@ -76,8 +77,17 @@ static struct dmic_cfg audio_cfg = {
 /* Buffer for processed audio */
 static int16_t processed_buffer[AUDIO_OPUS_FRAME_SIZE];
 
-/* Recording state */
-static bool recording_active = false;
+/* Recording lifecycle (see audio.h). Changed under audio_state_mutex. */
+enum {
+    PHASE_IDLE,         /* settled: audio thread waiting, a start may be accepted */
+    PHASE_STARTING,     /* start accepted, audio thread initializing */
+    PHASE_RECORDING,    /* capturing (possibly paused) */
+    PHASE_STOPPING,     /* stop requested, audio thread closing the session */
+};
+static atomic_t phase;
+static enum audio_kind current_kind;
+static uint32_t start_req_ms;   /* when the start was accepted (startup timing) */
+static atomic_t heartbeat;      /* audio thread progress, for the watchdog */
 static enum audio_mode current_mode = AUDIO_MODE_MERGE;
 static int opus_channels = 1;
 
@@ -87,16 +97,8 @@ static K_SEM_DEFINE(audio_start_sem, 0, 1);
 /* Mutex for protecting recording state */
 static K_MUTEX_DEFINE(audio_state_mutex);
 
-/* Set when a start is accepted; cleared only once the audio thread is back
- * waiting with no start pending (start skipped/failed, or stop cleanup
- * done). Spans starting, recording, paused and stopping. */
-static atomic_t capture_busy;
-
-/* Stop request flag */
+/* Stop request flag (latched during STARTING) */
 static volatile bool stop_requested = false;
-
-/* Semaphore: audio thread signals when stop cleanup is done */
-static struct k_sem stop_done_sem;
 
 /* Pause state */
 static volatile bool pause_requested = false;
@@ -232,9 +234,6 @@ int audio_init(void)
     nrf_pdm_gain_set(NRF_PDM0_NS, 0x48, 0x48);
 #endif
 
-    /* Initialize stop-done semaphore */
-    k_sem_init(&stop_done_sem, 0, 1);
-
     /* Start audio recording thread */
     audio_thread_id = k_thread_create(&audio_thread_data,
                       audio_thread_stack,
@@ -260,7 +259,7 @@ void audio_cleanup(void)
     audio_stop_recording();
 }
 
-int audio_start_recording(enum audio_mode mode)
+int audio_start_recording(enum audio_mode mode, enum audio_kind kind)
 {
     struct clip_context *c = clip_get_context();
     uint16_t year;
@@ -270,9 +269,11 @@ int audio_start_recording(enum audio_mode mode)
     /* Lock to protect session_id and state variables */
     k_mutex_lock(&audio_state_mutex, K_FOREVER);
 
-    if (recording_active) {
+    /* Only from settled IDLE: the previous session (and its id) stays
+     * untouched until its close has finished. */
+    if (atomic_get(&phase) != PHASE_IDLE) {
         k_mutex_unlock(&audio_state_mutex);
-        LOG_WRN("Recording already active");
+        LOG_WRN("audio not settled");
         return -EBUSY;
     }
 
@@ -299,12 +300,13 @@ int audio_start_recording(enum audio_mode mode)
     }
 
     /* Reset counters */
+    current_kind = kind;
     recording_frame_count = 0;
     stop_requested = false;
-    k_sem_reset(&stop_done_sem);
+    start_req_ms = k_uptime_get_32();
 
     /* Wake up audio thread by giving semaphore */
-    atomic_set(&capture_busy, 1);
+    atomic_set(&phase, PHASE_STARTING);
     k_sem_give(&audio_start_sem);
     k_mutex_unlock(&audio_state_mutex);
 
@@ -314,40 +316,54 @@ int audio_start_recording(enum audio_mode mode)
 
 int audio_stop_recording(void)
 {
+    int ret = -EALREADY;
+
     k_mutex_lock(&audio_state_mutex, K_FOREVER);
+    atomic_val_t ph = atomic_get(&phase);
 
-    if (!recording_active) {
-        /* Recording not yet active, but start may be pending (semaphore given
-         * but audio thread hasn't processed it yet). Set stop_requested so
-         * the audio thread skips the pending start.
-         */
+    if (ph == PHASE_STARTING || ph == PHASE_RECORDING) {
+        /* Latched: the audio thread skips a start it has not begun, or
+         * closes the new session as soon as its init is done. The pause
+         * polling loop checks it too. */
         stop_requested = true;
-        k_mutex_unlock(&audio_state_mutex);
-        return 0;
+        atomic_set(&phase, PHASE_STOPPING);
+        ret = 0;
     }
-
-    /* Set stop request flag - audio thread will handle cleanup.
-     * Pause polling loop checks stop_requested, so no semaphore needed.
-     */
-    stop_requested = true;
-
     k_mutex_unlock(&audio_state_mutex);
-    LOG_INF("Recording stop requested");
 
-    /* Wait for audio thread to finish cleanup (file close + sync on slow SD) */
-    if (k_sem_take(&stop_done_sem, K_MSEC(5000)) != 0) {
-        LOG_WRN("audio stop timed out (slow SD close?)");
-        return -ETIMEDOUT;
+    if (ret == 0) {
+        LOG_INF("Recording stop requested");
     }
+    return ret;
+}
 
+int audio_wait_settled(int32_t timeout_ms)
+{
+    for (; atomic_get(&phase) != PHASE_IDLE; timeout_ms -= 20) {
+        if (timeout_ms <= 0) {
+            LOG_WRN("audio not settled (slow SD close?)");
+            return -ETIMEDOUT;
+        }
+        k_sleep(K_MSEC(20));
+    }
     return 0;
+}
+
+const char *audio_get_kind(void)
+{
+    return current_kind == AUDIO_KIND_NOTE ? "note" : "command";
+}
+
+uint32_t audio_heartbeat(void)
+{
+    return (uint32_t)atomic_get(&heartbeat);
 }
 
 int audio_pause_recording(void)
 {
     k_mutex_lock(&audio_state_mutex, K_FOREVER);
 
-    if (!recording_active || is_paused) {
+    if (atomic_get(&phase) != PHASE_RECORDING || is_paused) {
         k_mutex_unlock(&audio_state_mutex);
         return 0;
     }
@@ -364,7 +380,7 @@ int audio_resume_recording(void)
 {
     k_mutex_lock(&audio_state_mutex, K_FOREVER);
 
-    if (!recording_active || !is_paused) {
+    if (atomic_get(&phase) != PHASE_RECORDING || !is_paused) {
         k_mutex_unlock(&audio_state_mutex);
         return 0;
     }
@@ -377,18 +393,14 @@ int audio_resume_recording(void)
     return 0;
 }
 
-bool audio_capture_busy(void)
-{
-    return atomic_get(&capture_busy) != 0;
-}
-
 bool audio_is_recording(void)
 {
-    k_mutex_lock(&audio_state_mutex, K_FOREVER);
-    bool is_active = recording_active;
-    k_mutex_unlock(&audio_state_mutex);
+    return atomic_get(&phase) != PHASE_IDLE;
+}
 
-    return is_active;
+bool audio_is_capturing(void)
+{
+    return atomic_get(&phase) == PHASE_RECORDING;
 }
 
 int audio_add_bookmark(void)
@@ -397,7 +409,7 @@ int audio_add_bookmark(void)
     struct audio_stats stats;
 
     /* Check if recording is active */
-    if (!audio_is_recording()) {
+    if (!audio_is_capturing()) {
         return -EINVAL;
     }
 
@@ -420,7 +432,7 @@ int audio_get_stats(struct audio_stats *stats_out)
     }
 
     /* Calculate average if recording stopped */
-    if (!recording_active && stats.frames_encoded > 0) {
+    if (atomic_get(&phase) == PHASE_IDLE && stats.frames_encoded > 0) {
         stats.encode_time_avg_us = (uint32_t)(encode_time_total_us / stats.frames_encoded);
     }
 
@@ -567,13 +579,23 @@ static int audio_start_recording_internal(enum audio_mode mode)
     /* Discard initial frames to eliminate mic power-up pop */
     dmic_flush_initial();
 
+    /* Stop latched during init: cancel before any file exists, so no
+     * recording is invented. */
+    if (stop_requested) {
+        dmic_trigger(dmic_dev, DMIC_TRIGGER_STOP);
+        mic_power_off();
+        clip_cpu_boost_release();
+        return -ECANCELED;
+    }
+
     /* Create storage session + first file — done AFTER mic/opus/dmic init
      * so a failure in those steps doesn't leak an orphan session. */
     {
         uint8_t channels = (mode == AUDIO_MODE_STEREO) ? 2 : 1;
         const char *mode_str = (mode == AUDIO_MODE_STEREO) ? "stereo" : "mono";
         ret = storage_create_session(current_session_id, channels,
-                                     AUDIO_SAMPLE_RATE, mode_str);
+                                     AUDIO_SAMPLE_RATE, mode_str,
+                                     audio_get_kind());
         if (ret != 0 && ret != -EEXIST) {
             LOG_WRN("Failed to create storage session: %d", ret);
         }
@@ -587,15 +609,31 @@ static int audio_start_recording_internal(enum audio_mode mode)
         }
     }
 
-    recording_active = true;
-    is_paused = false;
+    /* Ready: cue the user now, so speech after the buzz is captured, then
+     * drop the frames that heard the motor. No cue if a stop is latched
+     * (the session then closes at once, empty). */
+    if (!stop_requested) {
+        void *buf;
+        uint32_t sz;
 
-    /* Calculate actual bitrate for logging */
-    uint32_t actual_bitrate = (current_mode == AUDIO_MODE_STEREO) ?
-        CONFIG_CLIP_NORMAL_BITRATE * 2 : CONFIG_CLIP_ENHANCED_BITRATE;
-    LOG_INF("rec: %s %ukbps %s",
-        (current_mode == AUDIO_MODE_STEREO) ? "stereo" : "mono",
-        actual_bitrate/1000, current_session_id);
+        haptic_play_pattern(HAPTIC_SHORT);
+        audio_wait_haptic_quiet();
+        while (dmic_read(dmic_dev, 0, &buf, &sz, 0) == 0) {
+            k_mem_slab_free(&audio_mem_slab, buf);
+        }
+    }
+    is_paused = false;
+    k_mutex_lock(&audio_state_mutex, K_FOREVER);
+    if (atomic_get(&phase) == PHASE_STARTING) {
+        atomic_set(&phase, PHASE_RECORDING);
+    }
+    k_mutex_unlock(&audio_state_mutex);
+    clip_event_audio_news(CLIP_AUDIO_READY);
+
+    /* Startup time (mic, encoder, SD session, cue) from the accepted start;
+     * the SD wake before it shows as "SD resume" in the log. */
+    LOG_INF("rec ready %s %s +%u ms", current_session_id, audio_get_kind(),
+            k_uptime_get_32() - start_req_ms);
     return 0;
 }
 
@@ -605,11 +643,6 @@ static int audio_stop_recording_internal(void)
     int ret;
     uint32_t duration_sec;
 
-    if (!recording_active) {
-        return 0;
-    }
-
-    recording_active = false;
     is_paused = false;
 
     /* Stop DMIC */
@@ -633,7 +666,8 @@ static int audio_stop_recording_internal(void)
 
     /* Close storage session */
     duration_sec = stats.recording_time_ms / 1000;
-    ret = storage_close_session(current_session_id, duration_sec, current_file_index);
+    ret = storage_close_session(current_session_id, duration_sec, current_file_index,
+                                audio_get_kind());
     if (ret != 0) {
         LOG_WRN("Failed to close storage session: %d", ret);
     }
@@ -653,6 +687,18 @@ static int audio_stop_recording_internal(void)
     return 0;
 }
 
+/* Back to settled IDLE (the session, if any, is closed): only now may a new
+ * start be accepted. The event thread then reports the final metadata. */
+static void audio_settle(bool failed)
+{
+    k_mutex_lock(&audio_state_mutex, K_FOREVER);
+    stop_requested = false;
+    pause_requested = false;
+    atomic_set(&phase, PHASE_IDLE);
+    k_mutex_unlock(&audio_state_mutex);
+    clip_event_audio_news(CLIP_AUDIO_SETTLED | (failed ? CLIP_AUDIO_FAILED : 0));
+}
+
 /* Audio recording thread */
 void audio_recording_thread(void *p1, void *p2, void *p3)
 {
@@ -668,32 +714,25 @@ void audio_recording_thread(void *p1, void *p2, void *p3)
     ARG_UNUSED(p3);
 
     while (true) {
-        /* Settled. Checked under the lock audio_start_recording() holds
-         * while it sets capture_busy and gives the semaphore. */
-        k_mutex_lock(&audio_state_mutex, K_FOREVER);
-        if (k_sem_count_get(&audio_start_sem) == 0) {
-            atomic_set(&capture_busy, 0);
-        }
-        k_mutex_unlock(&audio_state_mutex);
-
         /* Wait for start signal (blocks here) */
         k_sem_take(&audio_start_sem, K_FOREVER);
+        atomic_inc(&heartbeat);
 
-        /* Check if stop was requested before we started */
-        if (stop_requested) {
-            stop_requested = false;
-            continue;
-        }
-
-        /* Perform initialization in audio thread context */
-        ret = audio_start_recording_internal(current_mode);
+        /* A stop latched before we got here skips the start; otherwise
+         * initialize in audio thread context. */
+        ret = stop_requested ? -ECANCELED : audio_start_recording_internal(current_mode);
         if (ret < 0) {
-            LOG_ERR("Failed to start recording: %d", ret);
+            if (ret != -ECANCELED) {
+                LOG_ERR("Failed to start recording: %d", ret);
+            }
+            audio_settle(ret != -ECANCELED);
             continue;
         }
 
         /* Recording loop - process audio until stop requested */
         while (!stop_requested) {
+            atomic_inc(&heartbeat);
+
             /* Check for pause request */
             if (pause_requested) {
                 pause_requested = false;
@@ -715,6 +754,7 @@ void audio_recording_thread(void *p1, void *p2, void *p3)
 
                 /* Wait for resume signal */
                 while (is_paused && !stop_requested) {
+                    atomic_inc(&heartbeat);
                     k_sleep(K_MSEC(100));
                 }
 
@@ -956,16 +996,12 @@ create_new_segment:
 
         /* Perform cleanup in audio thread context */
         audio_stop_recording_internal();
-        stop_requested = false;
-        pause_requested = false;
-
-        /* Signal that stop is complete */
-        k_sem_give(&stop_done_sem);
 
         LOG_INF("rec done: %u frm %us %uKB",
             stats.frames_encoded,
             (unsigned int)(stats.recording_time_ms / 1000),
             (unsigned int)(stats.total_bytes / 1024));
+        audio_settle(false);
     }
 }
 

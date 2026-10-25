@@ -46,11 +46,9 @@ static bool log_fs_active = IS_ENABLED(CONFIG_CLIP_LOG_FS_DEFAULT_ON);
 
 static void reboot_work_handler(struct k_work *work)
 {
-    /* Stop recording if active before rebooting */
-    if (audio_is_recording()) {
-        audio_stop_recording();
-        k_sleep(K_MSEC(100));
-    }
+    /* Stop recording if active before rebooting, and let it settle */
+    (void)audio_stop_recording();
+    (void)audio_wait_settled(5000);
     if (reboot_clear_bonds) {
         ble_clear_bonds();
     }
@@ -262,7 +260,9 @@ static int cmd_gstat_handler(struct at_cmd_ctx *ctx, char *response, size_t len)
                      "\"mode\":\"%s\","
                      "\"bitrate\":%u,"
                      "\"free_space\":%u,"
-                     "\"device\":\"%s\"}",
+                     "\"device\":\"%s\","
+                     "\"wdt\":%s,"
+                     "\"lp_reset\":%s}",
                      clip_state_to_string(clip_event_get_state()),
                      audio_is_recording() ? "true" : "false",
                      session_id ? "\"" : "", session_id ? session_id : "null", session_id ? "\"" : "",
@@ -274,7 +274,9 @@ static int cmd_gstat_handler(struct at_cmd_ctx *ctx, char *response, size_t len)
                      mode_str,
                      (c->config.mode == MODE_NORMAL) ? CONFIG_CLIP_NORMAL_BITRATE : CONFIG_CLIP_ENHANCED_BITRATE,
                      free_space,
-                     device_name ? device_name : "Unknown");
+                     device_name ? device_name : "Unknown",
+                     clip_wdt_running() ? "true" : "false",
+                     clip_pmic_lp_reset_off() ? "false" : "true");
 
     if (data_len < 0 || data_len >= sizeof(data_buf)) {
         return AT_ERR_NOMEM;
@@ -876,9 +878,13 @@ static int cmd_start_handler(struct at_cmd_ctx *ctx, char *response, size_t len)
 {
     struct clip_context *c = clip_get_context();
     enum recording_mode rec_mode;
+    /* AT+START (the app) records a note unless asked for a command */
+    enum clip_event start = CLIP_EVENT_START;
 
     /* Parse mode parameter if provided */
-    if (ctx->args && strlen(ctx->args) > 0) {
+    if (ctx->args && strcmp(ctx->args, "command") == 0) {
+        start = CLIP_EVENT_START_COMMAND;
+    } else if (ctx->args && strlen(ctx->args) > 0 && strcmp(ctx->args, "note") != 0) {
         char mode_str[32];
         strncpy(mode_str, ctx->args, sizeof(mode_str) - 1);
         mode_str[sizeof(mode_str) - 1] = '\0';
@@ -894,7 +900,7 @@ static int cmd_start_handler(struct at_cmd_ctx *ctx, char *response, size_t len)
         } else if (strcmp(mode_str, "enhanced") == 0 || strcmp(mode_str, "merge") == 0) {
             rec_mode = MODE_ENHANCED;
         } else {
-            return create_json_response(false, "invalid mode (normal/stereo/enhanced/merge)", NULL, response, len);
+            return create_json_response(false, "invalid mode (normal/stereo/enhanced/merge/note/command)", NULL, response, len);
         }
 
         /* Apply mode for this session */
@@ -903,12 +909,9 @@ static int cmd_start_handler(struct at_cmd_ctx *ctx, char *response, size_t len)
         rec_mode = c->config.mode;
     }
 
-    /* Buzz BEFORE starting capture: the motor noise couples into the
-     * mics (audio also waits for haptic quiet before powering them on). */
-    haptic_play_pattern(HAPTIC_SHORT);
-
+    /* No buzz here: the audio thread cues the user once capture is ready. */
     struct clip_event_result_info info;
-    int ret = clip_post_event_sync(CLIP_EVENT_START, &info);
+    int ret = clip_post_event_sync(start, &info);
 
     if (ret != 0 || info.result != CLIP_EVENT_OK) {
         if (info.result == CLIP_EVENT_INVALID) {
@@ -924,7 +927,7 @@ static int cmd_start_handler(struct at_cmd_ctx *ctx, char *response, size_t len)
                                        NULL, response, len);
         }
         if (info.result == CLIP_EVENT_BUSY) {
-            return create_json_response(false, "Audio module busy",
+            return create_json_response(false, "Audio module busy (stopping)",
                                        NULL, response, len);
         }
         return create_json_response(false, "Failed to start recording",
@@ -954,15 +957,10 @@ static int cmd_stop_handler(struct at_cmd_ctx *ctx, char *response, size_t len)
     int ret = clip_post_event_sync(CLIP_EVENT_STOP, &info);
 
     if (ret != 0 || info.result != CLIP_EVENT_OK) {
-        /* Fallback: if audio is actually recording but state machine is
-         * out of sync, stop audio directly */
-        if (audio_is_recording() && info.result == CLIP_EVENT_INVALID) {
-            LOG_WRN("state/audio mismatch, force stop");
-            audio_stop_recording();
-        } else {
-            return create_json_response(false, "Not recording", NULL, response, len);
-        }
+        return create_json_response(false, "Not recording", NULL, response, len);
     }
+    /* Final stats once the session is closed (the IDLE event follows) */
+    (void)audio_wait_settled(5000);
 
     struct audio_stats audio_stats;
     if (audio_get_stats(&audio_stats) != 0) {
@@ -1225,14 +1223,15 @@ static int cmd_list_handler(struct at_cmd_ctx *ctx, char *response, size_t len)
 
         char data[256];
         int n = snprintf(data, sizeof(data),
-            "{\"files\":%u,\"size\":%u,\"synced\":%u,\"bookmarks\":%d,\"channels\":%u,\"sample_rate\":%u,\"mode\":\"%s\"}",
+            "{\"files\":%u,\"size\":%u,\"synced\":%u,\"bookmarks\":%d,\"channels\":%u,\"sample_rate\":%u,\"mode\":\"%s\",\"kind\":\"%s\"}",
             info.file_count,
             (unsigned int)info.total_bytes,
             info.synced_files,
             bm,
             info.channels,
             info.sample_rate_khz * 1000,
-            info.mode);
+            info.mode,
+            info.kind);
         if (n < 0 || n >= (int)sizeof(data)) {
             return create_json_response(false, "Response too large", NULL, response, len);
         }

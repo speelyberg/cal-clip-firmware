@@ -35,6 +35,15 @@ enum audio_mode {
 };
 
 /**
+ * @brief Capture kind, persisted in session.json and the state events.
+ * A button tap records a command; AT+START (the app) records a note.
+ */
+enum audio_kind {
+	AUDIO_KIND_COMMAND = 0,
+	AUDIO_KIND_NOTE = 1,
+};
+
+/**
  * @brief Audio statistics
  */
 struct audio_stats {
@@ -70,20 +79,48 @@ int audio_init(void);
  */
 void audio_cleanup(void);
 
-/**
- * @brief Start audio recording
- *
- * @param mode Audio mode (mono/stereo/merge)
- * @return 0 on success, negative error code on failure
+/*
+ * Recording lifecycle (one session at a time):
+ *   IDLE -> STARTING -> RECORDING -> STOPPING -> IDLE (settled)
+ * A start is accepted only when settled. A stop during STARTING is latched:
+ * the start is skipped or the new session closed at once. The audio thread
+ * reports READY (cue played, capture running) and SETTLED to the event
+ * thread with clip_event_audio_news().
  */
-int audio_start_recording(enum audio_mode mode);
 
 /**
- * @brief Stop audio recording
+ * @brief Start audio recording (IDLE -> STARTING); returns at once
  *
- * @return 0 on success, negative error code on failure
+ * @param mode Audio mode (mono/stereo/merge)
+ * @param kind Capture kind for this session
+ * @return 0 on success, -EBUSY unless settled
+ */
+int audio_start_recording(enum audio_mode mode, enum audio_kind kind);
+
+/**
+ * @brief Request a stop (STARTING/RECORDING -> STOPPING); returns at once
+ *
+ * @return 0 if requested, -EALREADY if idle or already stopping
  */
 int audio_stop_recording(void);
+
+/**
+ * @brief Wait until the audio thread has settled (IDLE)
+ *
+ * @return 0 when settled, -ETIMEDOUT
+ */
+int audio_wait_settled(int32_t timeout_ms);
+
+/**
+ * @brief Kind of the current (or last) session: "command" or "note"
+ */
+const char *audio_get_kind(void);
+
+/**
+ * @brief Audio thread progress counter (watchdog: a capture that is not
+ *        settled must keep advancing it)
+ */
+uint32_t audio_heartbeat(void);
 
 /**
  * @brief Pause audio recording
@@ -111,17 +148,15 @@ int audio_resume_recording(void);
 bool audio_is_paused(void);
 
 /**
- * @brief Check if recording is active
- *
- * @return true if recording, false otherwise
+ * @brief True from an accepted start until the audio thread has fully
+ *        settled again: starting, recording, paused and stopping.
  */
 bool audio_is_recording(void);
 
 /**
- * @brief True from an accepted start until the audio thread has fully
- *        settled again: starting, recording, paused and stopping.
+ * @brief True only while capturing (RECORDING, possibly paused)
  */
-bool audio_capture_busy(void);
+bool audio_is_capturing(void);
 
 /**
  * @brief Get audio statistics

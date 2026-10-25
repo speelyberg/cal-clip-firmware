@@ -146,4 +146,11 @@ bool clip_get_current_time(uint16_t *out_year, uint8_t *out_month, uint8_t *out_
  */
 const char *clip_state_to_string(enum clip_state state);
 
+/* Hardware watchdog running (main.c) */
+bool clip_wdt_running(void);
+
+/* nPM1300 long-press reset turned off and read back (main.c); false = the
+ * ~7 s PMIC hard reset still precedes the 8 s graceful power-off */
+bool clip_pmic_lp_reset_off(void);
+
 #endif /* CLIP_H */

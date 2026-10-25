@@ -207,14 +207,20 @@ enum clip_event {
     CLIP_EVENT_MARK,             // Add bookmark
     CLIP_EVENT_WIFI_ON,          // Turn on WiFi AP
     CLIP_EVENT_WIFI_OFF,         // Turn off WiFi AP
-    CLIP_EVENT_POWER_OFF_SHOW,   // Show power-off screen
+    CLIP_EVENT_HOLD,             // Button held 1 s (fuel-gauge save)
     CLIP_EVENT_POWER_OFF_EXEC,   // Execute power-off (ship mode)
     CLIP_EVENT_STATUS_SHOW,      // Show status display
     CLIP_EVENT_USB_CONNECTED,    // USB cable plugged in
     CLIP_EVENT_OTA_START,        // OTA update started
     CLIP_EVENT_OTA_DONE,         // OTA update completed
+    CLIP_EVENT_TOGGLE,           // Button tap: STOP if capturing, else START (command)
+    CLIP_EVENT_START_COMMAND,    // START with capture kind "command"
 };
 ```
+
+The audio thread reports its lifecycle (READY, SETTLED, FAILED) through
+`clip_event_audio_news()`, a flag word the event loop reads before each
+queued event; it cannot be dropped like a full queue would.
 
 **Transition Table** (excerpt):
 ```
@@ -629,14 +635,12 @@ Kconfig step to 0 restores the raw gauge value.
 
 | Event | State | Action |
 |-------|-------|--------|
-| Single click | RECORDING / PAUSED | `CLIP_EVENT_MARK` (bookmark) |
-| Single click | IDLE / ERROR / WIFI_SYNC | `CLIP_EVENT_STATUS_SHOW` |
-| Long press | RECORDING | `CLIP_EVENT_STOP` |
-| Long press | IDLE / ERROR | `CLIP_EVENT_START` |
-| Long press level 1/2/3 | Any | `CLIP_EVENT_POWER_OFF_SHOW` |
-| Release (after power-off show) | Any | `CLIP_EVENT_POWER_OFF_EXEC` |
+| Single click (tap, < 1 s) | Any | `CLIP_EVENT_TOGGLE` (event thread: STOP if the audio lifecycle is busy, else START as a command) |
+| Long press (1 s) | Any | `CLIP_EVENT_HOLD` (fuel-gauge save; the release never toggles) |
+| Release (after a hold) | Any | `CLIP_EVENT_STATUS_SHOW` |
+| Long press level 1 (8 s) | Not charging | `clip_request_shutdown()` at once, input locked |
 
-**Power-Off Sequence**: Two-step shutdown. Hold button shows power-off confirmation screen. Release triggers PMIC ship mode via `regulator_parent_ship_mode()`.
+**Power-Off Sequence**: One step at 8 s, no release needed. The shutdown thread stops any recording through the settled audio lifecycle, shows the power-off screen and enters PMIC ship mode via `regulator_parent_ship_mode()`. Protocol Appendix E documents the gestures, and the ~7 s nPM1300 long-press reset that still precedes it unless `CONFIG_CLIP_PMIC_LONG_PRESS_RESET_DISABLE` is set.
 
 ### 3.14 Display Controller (display.c)
 
@@ -828,12 +832,11 @@ Main thread: clip_event_process()
 **Semaphores (k_sem):**
 - `event_notify_sem`: Main loop wake-up (1 slot, binary)
 - `audio_start_sem`: Audio thread start/pause/resume signal
-- `stop_done_sem`: Audio thread stop-completion signal
 - `transfer_trigger_sem`: Transfer thread start signal
 - `file_closed_sem`: Storage -> transfer coordination
 
 **Mutexes (k_mutex):**
-- `audio_state_mutex`: Protects recording_active, is_paused, session_id
+- `audio_state_mutex`: Protects the audio lifecycle phase (IDLE/STARTING/RECORDING/STOPPING), stop request, is_paused, session_id
 - `audio_energy_mutex`: Protects energy level and history
 
 **Atomic Variables (atomic_t):**
@@ -885,17 +888,18 @@ Main thread: clip_event_process()
 
 | From | To | Trigger | Side Effects |
 |------|-----|---------|-------------|
-| IDLE | RECORDING | START | audio_start, haptic, display rec |
-| RECORDING | IDLE | STOP | audio_stop, haptic, display idle |
+| IDLE | RECORDING | START | audio_start (returns at once; READY later: cue, display rec, RECORDING event) |
+| RECORDING | (same) | STOP | stop request, haptic, display idle |
+| RECORDING / PAUSED | IDLE | audio SETTLED | IDLE event with final metadata |
 | RECORDING | PAUSED | PAUSE | audio_pause, haptic, display pause |
 | PAUSED | RECORDING | RESUME | audio_resume, haptic, display rec |
-| PAUSED | IDLE | STOP | audio_stop, haptic, display idle |
+| PAUSED | (same) | STOP | stop request, haptic, display idle |
 | IDLE | WIFI_SYNC | WIFI_ON | wifi_on() |
 | WIFI_SYNC | IDLE | WIFI_OFF | wifi_off() |
 | ERROR | IDLE | START | (transition only) |
 | Any | (same) | MARK | audio_add_bookmark, display mark |
 | Any | (same) | STATUS_SHOW | display status |
-| Any | (same) | POWER_OFF_SHOW | display power-off screen |
+| Any | (same) | HOLD | fuel-gauge save |
 | Any | (same) | POWER_OFF_EXEC | haptic, PMIC ship mode |
 
 ### 6.2 Transfer State Machine

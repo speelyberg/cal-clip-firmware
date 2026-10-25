@@ -51,6 +51,7 @@ struct storage_session_info {
     uint8_t channels;          /* 1=mono, 2=stereo */
     uint8_t sample_rate_khz;   /* Sample rate in kHz (e.g., 16 for 16000Hz) */
     char mode[16];             /* "normal" or "enhanced" */
+    char kind[8];              /* "command", "note", or "" (older firmware) */
 };
 
 /**
@@ -165,10 +166,12 @@ int storage_get_stats(struct storage_stats *stats);
  * @param channels Audio channels (1=mono, 2=stereo)
  * @param sample_rate Sample rate in Hz (e.g., 16000)
  * @param mode Recording mode ("normal" or "enhanced")
+ * @param kind Capture kind ("command" or "note")
  * @return 0 on success, negative error code on failure
  */
 int storage_create_session(const char *session_id, uint8_t channels,
-                          uint32_t sample_rate, const char *mode);
+                          uint32_t sample_rate, const char *mode,
+                          const char *kind);
 
 /**
  * @brief Close a recording session
@@ -178,10 +181,11 @@ int storage_create_session(const char *session_id, uint8_t channels,
  * @param session_id Session ID
  * @param duration_sec Recording duration in seconds
  * @param chunk_count Number of chunk files
+ * @param kind Capture kind ("command" or "note")
  * @return 0 on success, negative error code on failure
  */
 int storage_close_session(const char *session_id, uint32_t duration_sec,
-                         uint32_t chunk_count);
+                         uint32_t chunk_count, const char *kind);
 
 /**
  * @brief Write a chunk (Opus packet) as a separate file

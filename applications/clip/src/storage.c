@@ -81,9 +81,10 @@ static int update_free_space(void);
 static int create_marks_file(const char *path);
 static int create_session_json(const char *path, const char *session_id,
                                uint8_t channels, uint32_t sample_rate,
-                               const char *mode);
+                               const char *mode, const char *kind);
 static int update_session_json(const char *session_id, uint32_t duration_sec,
-                               uint32_t chunk_count, uint64_t session_bytes);
+                               uint32_t chunk_count, uint64_t session_bytes,
+                               const char *kind);
 static int flush_write_buffer(void);
 static void delete_dir_contents(const char *dir_path);
 static int validate_session_id(const char *session_id);
@@ -567,7 +568,8 @@ static int validate_session_id(const char *session_id)
 }
 
 int storage_create_session(const char *session_id, uint8_t channels,
-                           uint32_t sample_rate, const char *mode)
+                           uint32_t sample_rate, const char *mode,
+                           const char *kind)
 {
     char metadata_path[STORAGE_PATH_MAX];
     char marks_path[STORAGE_PATH_MAX];
@@ -600,7 +602,7 @@ int storage_create_session(const char *session_id, uint8_t channels,
     if (rc != 0) {
         return rc;
     }
-    rc = create_session_json(metadata_path, session_id, channels, sample_rate, mode);
+    rc = create_session_json(metadata_path, session_id, channels, sample_rate, mode, kind);
     if (rc != 0) {
         return rc;
     }
@@ -614,7 +616,7 @@ int storage_create_session(const char *session_id, uint8_t channels,
 }
 
 int storage_close_session(const char *session_id, uint32_t duration_sec,
-                          uint32_t chunk_count)
+                          uint32_t chunk_count, const char *kind)
 {
     if (!session_id)
     {
@@ -627,7 +629,7 @@ int storage_close_session(const char *session_id, uint32_t duration_sec,
             session_id, chunk_count, duration_sec);
 
     /* Update session.json with final values */
-    update_session_json(session_id, duration_sec, chunk_count, session_bytes);
+    update_session_json(session_id, duration_sec, chunk_count, session_bytes, kind);
 
     /* Clear current session if matching */
     if (strcmp(current_session_id, session_id) == 0)
@@ -1350,6 +1352,18 @@ int storage_get_session_info(const char *session_id, struct storage_session_info
                 }
             }
 
+            /* Parse capture kind (absent before tap-control firmware) */
+            p = strstr(json_buf, "\"kind\": \"");
+            if (p)
+            {
+                strncpy(info->kind, p + 9, sizeof(info->kind) - 1);
+                char *end = strchr(info->kind, '"');
+                if (end)
+                {
+                    *end = '\0';
+                }
+            }
+
             /* Parse recording flag - if still recording, reset synced */
             p = strstr(json_buf, "\"recording\":");
             if (p && strncmp(p + 12, "true", 4) == 0)
@@ -1695,7 +1709,7 @@ static int create_marks_file(const char *marks_path)
 
 static int create_session_json(const char *json_path, const char *session_id,
                                uint8_t channels, uint32_t sample_rate,
-                               const char *mode)
+                               const char *mode, const char *kind)
 {
     struct fs_file_t file;
     char json_buf[512];
@@ -1720,9 +1734,10 @@ static int create_session_json(const char *json_path, const char *session_id,
                    "  \"channels\": %u,\n"
                    "  \"sample_rate\": %u,\n"
                    "  \"mode\": \"%s\",\n"
+                   "  \"kind\": \"%s\",\n"
                    "  \"recording\": true\n"
                    "}\n",
-                   session_id, channels, sample_rate, mode ? mode : "normal");
+                   session_id, channels, sample_rate, mode ? mode : "normal", kind);
 
     if (len < 0 || len >= (int)sizeof(json_buf))
     {
@@ -1746,7 +1761,8 @@ static int create_session_json(const char *json_path, const char *session_id,
 }
 
 static int update_session_json(const char *session_id, uint32_t duration_sec,
-                               uint32_t chunk_count, uint64_t session_bytes)
+                               uint32_t chunk_count, uint64_t session_bytes,
+                               const char *kind)
 {
     char json_path[STORAGE_PATH_MAX];
     struct fs_file_t file;
@@ -1835,11 +1851,12 @@ static int update_session_json(const char *session_id, uint32_t duration_sec,
                    "  \"channels\": %s,\n"
                    "  \"sample_rate\": %s,\n"
                    "  \"mode\": \"%s\",\n"
+                   "  \"kind\": \"%s\",\n"
                    "  \"recording\": false\n"
                    "}\n",
                    session_id, duration_sec, chunk_count,
                    (unsigned int)session_bytes,
-                   synced_str, channels_str, sample_rate_str, mode_str);
+                   synced_str, channels_str, sample_rate_str, mode_str, kind);
 
     if (len < 0 || len >= (int)sizeof(json_buf))
     {

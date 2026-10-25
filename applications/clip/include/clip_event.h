@@ -27,12 +27,15 @@ enum clip_event {
     CLIP_EVENT_MARK,
     CLIP_EVENT_WIFI_ON,
     CLIP_EVENT_WIFI_OFF,
-    CLIP_EVENT_POWER_OFF_SHOW,
+    CLIP_EVENT_HOLD,            /* button held 1 s (pre-shutdown fuel-gauge save) */
     CLIP_EVENT_POWER_OFF_EXEC,
     CLIP_EVENT_STATUS_SHOW,
     CLIP_EVENT_USB_CONNECTED,
     CLIP_EVENT_OTA_START,
     CLIP_EVENT_OTA_DONE,
+    /* Mapped onto START/STOP before the transition table (no columns): */
+    CLIP_EVENT_TOGGLE,          /* button tap: STOP if capturing, else START (command) */
+    CLIP_EVENT_START_COMMAND,   /* START with capture kind "command" (CLIP_EVENT_START = "note") */
     CLIP_EVENT_COUNT,
 };
 
@@ -128,5 +131,13 @@ void clip_event_process(void);
  * @brief Cancel ongoing OTA (e.g., on BLE disconnect)
  */
 void clip_event_ota_cancel(void);
+
+/* Audio lifecycle news for the event thread. Never dropped (a flag, not the
+ * event queue): READY = capture running, cue played; SETTLED = audio thread
+ * idle again after a stop, a cancelled start or a failure (FAILED). */
+#define CLIP_AUDIO_READY   BIT(0)
+#define CLIP_AUDIO_SETTLED BIT(1)
+#define CLIP_AUDIO_FAILED  BIT(2)
+void clip_event_audio_news(atomic_val_t news);
 
 #endif /* CLIP_EVENT_H */

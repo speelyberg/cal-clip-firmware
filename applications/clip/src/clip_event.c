@@ -40,12 +40,16 @@ LOG_MODULE_REGISTER(clip_event, LOG_LEVEL_WRN); /* chatty event-flow logs */
 /* ========================================================================== */
 
 #define TRANS_INVALID  0   /* No valid transition */
-#define TRANS_SAME     255 /* Stay in current state (MARK, STATUS, POWER_OFF_SHOW) */
+#define TRANS_SAME     255 /* Stay in current state (MARK, STATUS, HOLD) */
 
 /*
  * transition_table[current_state][event] = next_state
  *
- *                  START  STOP   PAUSE  RESUME MARK   WIFI_ON WIFI_OFF POFF_S POFF_E STATUS USB   OTA_S OTA_D
+ * STOP keeps RECORDING/PAUSED: the state turns IDLE only when the audio
+ * thread reports SETTLED (audio_news_process), so RECORDING spans the whole
+ * STARTING..STOPPING lifecycle and a new START waits for the old session.
+ *
+ *                  START  STOP   PAUSE  RESUME MARK   WIFI_ON WIFI_OFF HOLD   POFF_E STATUS USB   OTA_S OTA_D
  */
 static const uint8_t transition_table[CLIP_STATE_OTA + 1][CLIP_EVENT_COUNT] = {
     /* UNINITIALIZED */ { 0, 0, 0, 0, 0, 0, 0, TRANS_SAME, TRANS_SAME, 0,    0,    0,    0 },
@@ -53,7 +57,7 @@ static const uint8_t transition_table[CLIP_STATE_OTA + 1][CLIP_EVENT_COUNT] = {
                          CLIP_STATE_WIFI_SYNC, 0,
                          TRANS_SAME, TRANS_SAME, TRANS_SAME,
                          TRANS_SAME, TRANS_SAME, TRANS_SAME },
-    /* RECORDING     */ { 0, CLIP_STATE_IDLE, CLIP_STATE_PAUSED, 0,
+    /* RECORDING     */ { 0, TRANS_SAME, CLIP_STATE_PAUSED, 0,
                          TRANS_SAME, 0, 0,
                          TRANS_SAME, TRANS_SAME, 0,
                          TRANS_SAME, TRANS_SAME, TRANS_SAME },
@@ -65,7 +69,7 @@ static const uint8_t transition_table[CLIP_STATE_OTA + 1][CLIP_EVENT_COUNT] = {
                          TRANS_SAME,
                          CLIP_STATE_IDLE, TRANS_SAME, TRANS_SAME, TRANS_SAME,
                          TRANS_SAME, TRANS_SAME, TRANS_SAME },
-    /* PAUSED        */ { 0, CLIP_STATE_IDLE, 0, CLIP_STATE_RECORDING,
+    /* PAUSED        */ { 0, TRANS_SAME, 0, CLIP_STATE_RECORDING,
                          TRANS_SAME,
                          CLIP_STATE_WIFI_SYNC, 0,
                          TRANS_SAME, TRANS_SAME, 0,
@@ -132,6 +136,17 @@ bool clip_event_ota_in_progress(void)
 void clip_request_shutdown(void)
 {
 	k_sem_give(&shutdown_sem);
+}
+
+/* Audio lifecycle news (CLIP_AUDIO_*), consumed by the event thread. A flag
+ * word instead of the event queue: it can't be dropped when the queue is
+ * full, and a lost SETTLED would leave the state machine in RECORDING. */
+static atomic_t audio_news;
+
+void clip_event_audio_news(atomic_val_t news)
+{
+	atomic_or(&audio_news, news);
+	k_sem_give(&event_notify_sem);
 }
 
 static void ota_progress_work_handler(struct k_work *work)
@@ -313,9 +328,10 @@ static struct mgmt_callback mcumgr_dfu_cb_stopped;
 #define SD_IDLE_POWEROFF_DELAY_MS  K_MSEC(CONFIG_CLIP_SD_IDLE_DELAY_MS)
 static struct k_work_delayable sd_idle_poweroff_work;
 
-/* Deferred fuel-gauge state save at the power-off level (so a 7 s PMIC hard
- * reset that bypasses POWER_OFF_EXEC doesn't lose the SoC). Runs on the system
- * workqueue so it can't block the main event thread / the 3 s power-off flow. */
+/* Deferred fuel-gauge state save when a hold is recognized (so a ~7 s PMIC
+ * long-press hard reset, still enabled unless the app disables it, doesn't
+ * lose the SoC). Runs on the system workqueue so it can't block the main
+ * event thread. */
 static struct k_work fg_save_work;
 static void fg_save_work_handler(struct k_work *work)
 {
@@ -489,16 +505,75 @@ void clip_event_wait(k_timeout_t timeout)
     k_sem_take(&event_notify_sem, timeout);
 }
 
+/* Capture kind for the START being executed (event thread only) */
+static enum audio_kind start_kind;
+/* The current session was announced with a RECORDING event */
+static bool session_announced;
+
+static void audio_news_process(void)
+{
+    atomic_val_t news = atomic_clear(&audio_news);
+    struct clip_context *c = clip_get_context();
+
+    if (news & CLIP_AUDIO_READY) {
+        /* Capture running, cue played: announce the session now */
+        session_announced = true;
+        if (audio_is_capturing()) {     /* not already being stopped */
+            display_post_event(UI_EVENT_REC_START);
+            display_set_recording(true, c->config.mode == MODE_ENHANCED);
+        }
+        ble_notify_state_change("RECORDING", audio_get_session_id(),
+                                audio_get_kind(), -1, 0);
+    }
+    if (news & CLIP_AUDIO_SETTLED) {
+        enum clip_state st = (enum clip_state)atomic_get(&g_state);
+
+        if (st == CLIP_STATE_RECORDING || st == CLIP_STATE_PAUSED) {
+            atomic_set(&g_state, CLIP_STATE_IDLE);
+        }
+        if (news & CLIP_AUDIO_FAILED) {
+            display_post_error("Rec Fail");
+        }
+        /* Final metadata only now that the session is closed, and only
+         * for a session that exists (a cancelled start made no file). */
+        if (session_announced) {
+            struct audio_stats stats;
+
+            session_announced = false;
+            display_post_event(UI_EVENT_REC_STOP);
+            display_set_recording(false, false);
+            audio_get_stats(&stats);
+            ble_notify_state_change("IDLE", audio_get_session_id(), audio_get_kind(),
+                                    (int)(stats.recording_time_ms / 1000U),
+                                    stats.frames_encoded);
+        }
+    }
+}
+
 void clip_event_process(void)
 {
     struct clip_event_item item;
 
-    while (k_msgq_get(&clip_ev_msgq, &item, K_NO_WAIT) == 0) {
+    for (audio_news_process(); k_msgq_get(&clip_ev_msgq, &item, K_NO_WAIT) == 0;
+         audio_news_process()) {
         enum clip_state current = (enum clip_state)atomic_get(&g_state);
 
         if (item.event >= CLIP_EVENT_COUNT) {
             LOG_WRN("Invalid event: %d", item.event);
             goto notify;
+        }
+
+        /* Button tap: toggle by the audio lifecycle itself (stop anything
+         * starting, recording, paused; a tap while stopping is a no-op),
+         * and make a disconnected Clip quick to reconnect. */
+        start_kind = AUDIO_KIND_NOTE;
+        if (item.event == CLIP_EVENT_TOGGLE) {
+            ble_adv_restart_fast();
+            item.event = audio_is_recording() ? CLIP_EVENT_STOP : CLIP_EVENT_START_COMMAND;
+        }
+        if (item.event == CLIP_EVENT_START_COMMAND) {
+            start_kind = AUDIO_KIND_COMMAND;
+            item.event = CLIP_EVENT_START;
         }
 
         /* Special case: recording blocked while WiFi active */
@@ -536,11 +611,6 @@ void clip_event_process(void)
         enum clip_event_result result = execute_transition(item.event, current, new_state);
 
         if (result == CLIP_EVENT_OK && next != TRANS_SAME) {
-            /* Sanity check: warn if state leaves RECORDING while audio active */
-            if (current == CLIP_STATE_RECORDING && audio_is_recording()) {
-                LOG_WRN("leave REC (%d->%d) audio active",
-                         current, new_state);
-            }
             atomic_set(&g_state, (atomic_val_t)new_state);
         }
 
@@ -574,20 +644,18 @@ static void shutdown_thread_fn(void)
         /* Ignore all button input from here on. */
         button_shutdown_lockout();
 
+        /* Stop recording first, through the same settled lifecycle as a
+         * tap (a start in progress is cancelled or closed) — file integrity
+         * is the one thing worth waiting for. Request before the buzz so
+         * the motor stays out of the recording. */
+        (void)audio_stop_recording();
+        display_post_event(UI_EVENT_POWER_OFF_SHOW);
+
         /* Confirmation buzz plays on the haptic thread WHILE we clean up. */
         haptic_play_pattern(HAPTIC_DOUBLE);
         int64_t power_cut_earliest = k_uptime_get() + 800;
 
-        /* Stop recording first — file integrity is the one thing worth
-         * waiting for. */
-        if (audio_is_recording()) {
-            LOG_INF("Stopping recording before power off");
-            int stop_rc = audio_stop_recording();
-            if (stop_rc != 0) {
-                LOG_WRN("audio_stop %d (slow SD) grace", stop_rc);
-                k_sleep(K_MSEC(500));
-            }
-        }
+        (void)audio_wait_settled(5000);   /* within the 8 s failsafe */
 
         /* Signal the transfer to stop (flag only). */
         if (transfer_is_active()) {
@@ -647,8 +715,6 @@ static enum clip_event_result execute_transition(enum clip_event event,
     switch (event) {
     case CLIP_EVENT_START:
     {
-        struct clip_context *ctx = clip_get_context();
-
         /* SD may be idle-powered-off — bring it up before recording writes */
         err = storage_ensure_mounted();
         if (err) {
@@ -667,63 +733,36 @@ static enum clip_event_result execute_transition(enum clip_event event,
             return CLIP_EVENT_ERROR;
         }
 
-        err = audio_start_recording(AUDIO_MODE_MERGE);
+        /* Returns at once; the audio thread cues the user and reports
+         * READY when capture is really running (audio_news_process). */
+        err = audio_start_recording(AUDIO_MODE_MERGE, start_kind);
         if (err) {
-            if (err == -EBUSY) {
-                return CLIP_EVENT_BUSY;
-            }
-            LOG_ERR("audio_start_recording failed: %d", err);
-            display_post_error("Rec Fail");
-            return CLIP_EVENT_ERROR;
+            return CLIP_EVENT_BUSY;     /* previous session not settled */
         }
-        display_post_event(UI_EVENT_REC_START);
-        display_set_recording(true, c->config.mode == MODE_ENHANCED);
-        ble_notify_state_change("RECORDING", audio_get_session_id(), -1);
+        session_announced = false;
         return CLIP_EVENT_OK;
     }
 
     case CLIP_EVENT_STOP:
     {
-        if (!audio_is_recording()) {
-            return CLIP_EVENT_INVALID;
+        /* Request only (also latches a stop during startup): the SD flush
+         * runs on the audio thread, and the state turns IDLE with the final
+         * metadata when it settles. Already stopping: nothing more to do. */
+        if (audio_stop_recording() != 0) {
+            return audio_is_recording() ? CLIP_EVENT_OK : CLIP_EVENT_INVALID;
         }
 
-        /* Feedback FIRST: haptic (non-blocking, own thread) + UI flags post
-         * instantly at the button threshold, BEFORE the SD-bound file flush
-         * below — which can take hundreds of ms when a transfer is reading
-         * the card. The stop itself completes right after. */
+        /* Feedback right after the request, so the motor stays out of the
+         * recording's tail: haptic (own thread) + UI flags. */
         haptic_play_pattern(HAPTIC_DOUBLE);  /* stop = 2 buzzes (button or AT) */
         display_post_event(UI_EVENT_REC_STOP);
         display_set_recording(false, false);
-
-        err = audio_stop_recording();
-        if (err == -ETIMEDOUT) {
-            /* Stop was requested but the audio thread is slow to flush/close
-             * the file (SD busy, e.g. a concurrent transfer reading the card).
-             * The stop IS committed and completes asynchronously — commit IDLE
-             * now so the state machine never deadlocks in RECORDING (which
-             * would drop the IDLE notification and make the host flood STOP).
-             * The recording tail may be cut, which is acceptable. */
-            LOG_WRN("stop slow (SD busy), IDLE async");
-        } else if (err) {
-            LOG_ERR("audio_stop_recording failed: %d", err);
-            return CLIP_EVENT_ERROR;
-        }
-        {
-            struct audio_stats stats;
-            int dur = -1;
-
-            if (audio_get_stats(&stats) == 0) {
-                dur = (int)(stats.recording_time_ms / 1000U);
-            }
-            ble_notify_state_change("IDLE", audio_get_session_id(), dur);
-        }
         return CLIP_EVENT_OK;
     }
 
     case CLIP_EVENT_PAUSE:
     {
-        if (!audio_is_recording()) {
+        if (!audio_is_capturing()) {
             return CLIP_EVENT_INVALID;
         }
 
@@ -734,7 +773,7 @@ static enum clip_event_result execute_transition(enum clip_event event,
         }
         haptic_play_pattern(HAPTIC_SHORT);
         display_post_event(UI_EVENT_REC_PAUSE);
-        ble_notify_state_change("PAUSED", audio_get_session_id(), -1);
+        ble_notify_state_change("PAUSED", audio_get_session_id(), audio_get_kind(), -1, 0);
         return CLIP_EVENT_OK;
     }
 
@@ -750,13 +789,13 @@ static enum clip_event_result execute_transition(enum clip_event event,
         }
         display_post_event(UI_EVENT_REC_RESUME);
         display_set_recording(true, c->config.mode == MODE_ENHANCED);
-        ble_notify_state_change("RECORDING", audio_get_session_id(), -1);
+        ble_notify_state_change("RECORDING", audio_get_session_id(), audio_get_kind(), -1, 0);
         return CLIP_EVENT_OK;
     }
 
     case CLIP_EVENT_MARK:
     {
-        if (!audio_is_recording()) {
+        if (!audio_is_capturing()) {
             return CLIP_EVENT_INVALID;
         }
 
@@ -802,16 +841,13 @@ static enum clip_event_result execute_transition(enum clip_event event,
         return CLIP_EVENT_OK;
     }
 
-    case CLIP_EVENT_POWER_OFF_SHOW:
+    case CLIP_EVENT_HOLD:
     {
-        /* A held-long-enough press triggers a PMIC hardware reset that
-         * bypasses the software POWER_OFF_EXEC shutdown (where the fuel-gauge
-         * state is normally persisted). Queue a save now, at the 3 s poweroff
-         * level, so a hard reset doesn't lose it. Deferred to the system
-         * workqueue so it cannot block this thread or the 3 s power-off flow;
-         * POWER_OFF_EXEC saves a fresh copy again on a graceful release. */
+        /* A held-long-enough press can trigger the PMIC long-press hard
+         * reset (~7 s) before the 8 s graceful shutdown, bypassing its
+         * fuel-gauge save. Queue a save now; deferred to the system
+         * workqueue so it cannot block this thread. */
         k_work_submit(&fg_save_work);
-        display_post_event(UI_EVENT_POWER_OFF_SHOW);
         return CLIP_EVENT_OK;
     }
 

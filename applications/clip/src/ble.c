@@ -763,26 +763,25 @@ int ble_send(const uint8_t *data, uint16_t len)
     return 0;
 }
 
-int ble_notify_state_change(const char *state, const char *session_id, int duration)
+int ble_notify_state_change(const char *state, const char *session_id,
+                            const char *kind, int duration, uint32_t frames)
 {
-    char buf[128];
+    char buf[160];
     int len;
 
     if (!ble_ctx.conn || !ble_ctx.notify_enabled) {
         return -ENOTCONN;
     }
 
+    len = snprintf(buf, sizeof(buf),
+                   "{\"event\":\"state\",\"state\":\"%s\","
+                   "\"session\":\"%s\",\"kind\":\"%s\"",
+                   state, session_id, kind);
     if (duration >= 0) {
-        len = snprintf(buf, sizeof(buf),
-                       "{\"event\":\"state\",\"state\":\"%s\","
-                       "\"session\":\"%s\",\"duration\":%d}",
-                       state, session_id, duration);
-    } else {
-        len = snprintf(buf, sizeof(buf),
-                       "{\"event\":\"state\",\"state\":\"%s\","
-                       "\"session\":\"%s\"}",
-                       state, session_id);
+        len += snprintf(buf + len, sizeof(buf) - len,
+                        ",\"duration\":%d,\"frames\":%u", duration, frames);
     }
+    len += snprintf(buf + len, sizeof(buf) - len, "}");
 
     return ble_send(buf, len);
 }

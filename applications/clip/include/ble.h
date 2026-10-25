@@ -211,14 +211,18 @@ int ble_send_audio_vis(const uint8_t *data, uint16_t len);
 /**
  * @brief Notify recording state change via BLE
  *
- * Sends JSON event: {"event":"state","state":"<state>","session":"<id>"[,"duration":N]}
+ * Sends JSON event: {"event":"state","state":"<state>","session":"<id>",
+ * "kind":"<command|note>"[,"duration":N,"frames":N]}
  *
  * @param state State string (RECORDING, IDLE, PAUSED)
  * @param session_id Session ID string
- * @param duration Duration in seconds, or -1 if not applicable
+ * @param kind Capture kind ("command" or "note")
+ * @param duration Duration in whole seconds, or -1 if not applicable
+ * @param frames Encoded 20 ms Opus frames (sent with duration only)
  * @return 0 on success, negative error code on failure
  */
-int ble_notify_state_change(const char *state, const char *session_id, int duration);
+int ble_notify_state_change(const char *state, const char *session_id,
+                            const char *kind, int duration, uint32_t frames);
 
 /**
  * @brief Notify bookmark mark event via BLE

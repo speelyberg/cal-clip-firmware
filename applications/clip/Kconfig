@@ -103,6 +103,28 @@ config CLIP_SETTINGS_LOAD_TIMEOUT_MS
 	int "settings_load watchdog timeout (ms)"
 	default 3000
 
+config CLIP_WDT_TIMEOUT_MS
+	int "Hardware watchdog timeout (ms)"
+	default 30000
+	help
+	  nRF5340 WDT0, started just before the main event loop and fed only by
+	  that loop while the audio thread is settled or still making progress.
+	  30 s is about twice the longest bounded wait on those threads (WiFi
+	  AP start, ~5 s + 3 s; SD close, stock 5 s). Tune it from bench
+	  measurements. MCUboot feeds it during an image copy and in serial
+	  recovery (it keeps running across a soft reset).
+
+config CLIP_PMIC_LONG_PRESS_RESET_DISABLE
+	bool "Disable the nPM1300 long-press reset once the watchdog runs"
+	help
+	  The PMIC power-cycles the board when the button (SHPHLD) is held
+	  about 7 s, before the 8 s graceful power-off. With this option the
+	  app turns that reset off after the watchdog has started, and reads
+	  the setting back. MCUboot restores it on every boot. TODO: keep this
+	  off until the watchdog-recovery hardware gate has passed (forced
+	  hangs recover, recovery to MCUboot proven); until then an 8 s hold
+	  may end in the PMIC hard reset instead of a graceful shutdown.
+
 config CLIP_SD_IDLE_DELAY_MS
 	int "SD card idle power-off delay (ms)"
 	default 45000

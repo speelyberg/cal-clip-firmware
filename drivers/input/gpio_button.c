@@ -158,8 +158,18 @@ static void gpio_button_thread_cb(const struct device *dev)
 			// only generate a release event if we've received a press event
 			data->release_time = now;
 
-			// Debounce: ignore short press fluctuations
-			if (data->release_time - data->press_time < cfg->debounce_ms) {
+			/* Debounce: a press shorter than debounce_ms is a bounce or
+			 * glitch. Forget it entirely: leaving it armed made the
+			 * next real press time itself from this stale press_time
+			 * (an instant long press, or a tap read as a hold). */
+			if (data->waiting_for_release &&
+			    data->release_time - data->press_time < cfg->debounce_ms) {
+				data->waiting_for_release = false;
+				if (--data->press_count > 0) {
+					/* still inside a double-click window */
+					k_sleep(K_MSEC(30));
+					continue;
+				}
 				break;
 			}
 

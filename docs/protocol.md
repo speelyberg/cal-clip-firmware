@@ -339,14 +339,16 @@ AT+GSTAT
     "mode": "normal",
     "bitrate": 16000,
     "free_space": 1024,
-    "device": "Clip"
+    "device": "Clip",
+    "wdt": true,
+    "lp_reset": true
   }
 }
 ```
 
 **Fields:**
-- `state`: Current device state (IDLE/RECORDING/TRANSMITTING/WIFI_SYNC/PAUSED/ERROR)
-- `recording`: Whether actively recording (true/false)
+- `state`: Current device state (IDLE/RECORDING/TRANSMITTING/WIFI_SYNC/PAUSED/ERROR). RECORDING spans the whole recording lifecycle: from an accepted start until the session is closed (starting, recording, paused, stopping)
+- `recording`: True from an accepted start until the session is closed (true/false)
 - `session`: Current session ID or null
 - `duration`: Current recording duration in seconds
 - `battery`: Battery percentage (0-100)
@@ -357,6 +359,8 @@ AT+GSTAT
 - `bitrate`: Bitrate for current mode (normal=16000, enhanced=32000)
 - `free_space`: Free space in MB
 - `device`: Device name string
+- `wdt`: Hardware watchdog running (0.1.4+3 and later)
+- `lp_reset`: `true` while the nPM1300 long-press hard reset (~7 s button hold) is still enabled, so it can fire before the 8 s graceful power-off. `false` only when the app turned it off and read the setting back (`CONFIG_CLIP_PMIC_LONG_PRESS_RESET_DISABLE`, off by default until the watchdog-recovery hardware tests pass)
 
 **Error Cases:**
 - Never fails (always returns current state)
@@ -511,6 +515,9 @@ AT+START=normal
 
 **Parameters:**
 - `mode`: "normal" or "enhanced" (legacy aliases: "stereo" = normal, "merge" = enhanced; case-insensitive). Omitted → current mode.
+- or a capture kind instead (lowercase): `AT+START=note` (the default for `AT+START`) or `AT+START=command`. A button tap always records a `command`. The kind is stored in session.json and sent in the state events.
+
+The command returns once the start is accepted. The device buzzes once and sends the `RECORDING` state event when capture is actually running (microphone, encoder and SD file ready), so speech after the buzz is recorded.
 
 **Response:**
 ```json
@@ -525,8 +532,8 @@ AT+START=normal
 > `data` contains only the `session` id (an empty object if the id isn't ready yet).
 
 **Error Cases:**
-- `{"ok":false,"msg":"invalid mode (normal/stereo/enhanced/merge)"}` (bad mode argument)
-- `{"ok":false,"msg":"Already recording or invalid state"}` / `"Audio module busy"` / `"Failed to start recording"`
+- `{"ok":false,"msg":"invalid mode (normal/stereo/enhanced/merge/note/command)"}` (bad argument)
+- `{"ok":false,"msg":"Already recording or invalid state"}` / `"Audio module busy (stopping)"` (the previous session is still closing) / `"Failed to start recording"`
 - `"WiFi active, cannot record"` / `"USB MSC active, disable USB first"` (recording blocked while WiFi/USB active)
 
 **State Change:** IDLE → RECORDING
@@ -535,7 +542,6 @@ AT+START=normal
 - Creates new session directory
 - Initializes session.json
 - Starts audio capture
-- Enables button bookmarking
 
 ---
 
@@ -569,16 +575,17 @@ AT+STOP
 - `file_count`: Number of files in the session (1 for a fresh stop)
 - `total_size`: Total bytes of all files
 
+The response waits (up to 5 s) for the session to be closed, so the stats are final. A stop while the recording is still starting is accepted: the start is cancelled (no session is created, no state events) or the new session is closed at once. A second stop while one is in progress succeeds without effect.
+
 **Error Cases:**
 - `{"ok":false,"msg":"No active session"}` / `"Not recording"`
 
-**State Change:** RECORDING → IDLE
+**State Change:** RECORDING → IDLE (when the session is closed)
 
 **Side Effects:**
 - Finalizes session.json
 - Closes all files
 - Stops audio capture
-- Disables button bookmarking
 
 ---
 
@@ -673,7 +680,8 @@ AT+LIST=20240203100000?1&20
     "bookmarks": 5,
     "channels": 2,
     "sample_rate": 16000,
-    "mode": "normal"
+    "mode": "normal",
+    "kind": "command"
   }
 }
 ```
@@ -710,6 +718,7 @@ AT+LIST=20240203100000?1&20
 - `channels`: Audio channels - 1=mono, 2=stereo (only in session details)
 - `sample_rate`: Sample rate in Hz, e.g., 16000 (only in session details)
 - `mode`: Recording mode - "normal" (stereo) or "enhanced" (mono with DSP) (only in session details)
+- `kind`: Capture kind - "command" (button tap) or "note" (`AT+START`), or "" for sessions recorded by firmware before 0.1.4+3 (only in session details)
 
 **Usage Examples:**
 ```
@@ -1853,12 +1862,12 @@ When the device is actively recording, the client can start a transfer that cont
 │  └───────┬──────┘                                          │
 │          │ boot complete                                    │
 │          ▼                                                  │
-│  ┌──────────────┐  AT+START/Long press  ┌──────────┐       │
+│  ┌──────────────┐  AT+START / tap     ┌──────────┐       │
 │  │     IDLE     │<────────────────────────│RECORDING │       │
 │  └──┬───┬──────┘                        └─────┬────┘       │
 │     │   │                                      │            │
 │     │   │ AT+WIFI=on                             │ AT+STOP/   │
-│     │   ▼                                      │ Long press │
+│     │   ▼                                      │ tap        │
 │     │ ┌──────────────┐                          │            │
 │     │ │  WIFI_SYNC  │                          │            │
 │     │ └──────┬───────┘                          ▼            │
@@ -1900,28 +1909,16 @@ When the device is actively recording, the client can start a transfer that cont
 ### 5.2 Recording State Machine
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Recording State                       │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│   ┌──────────┐   Long press (1s) / AT+START   ┌────────┐│
-│   │   IDLE   │ ─────────────────────────────> │RECORDING│
-│   └──────────┘                                  └────┬───┘
-│        ▲                                             │   │
-│        │                Long press (1s) / AT+STOP    │   │
-│        │ <───────────────────────────────────────────┘   │
-│        │                                                     │
-│   Short press (add bookmark - only during recording)        │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
+IDLE --tap / AT+START--> STARTING --capture ready (1 buzz, RECORDING event)--> RECORDING
+RECORDING --tap / AT+STOP / 8 s hold / storage full--> STOPPING --session closed (IDLE event)--> IDLE
+STARTING --tap / AT+STOP--> STOPPING (start cancelled, or the new session closed at once)
 ```
 
-**Transitions:**
-- IDLE → RECORDING: Long button press OR `AT+START`
-- RECORDING → IDLE: Long button press OR `AT+STOP`
+The device state (`AT+GSTAT` `state`) reads RECORDING (or PAUSED) for the whole span from an accepted start to the closed session, and IDLE only once the session is settled. A new start is accepted only then.
 
-**Recording-Specific Actions:**
-- Short press during RECORDING: Add bookmark
+**Transitions:**
+- IDLE → RECORDING: button tap (kind `command`) OR `AT+START` (kind `note`, or `AT+START=command`)
+- RECORDING → IDLE: button tap OR `AT+STOP` OR 8 s power-off hold, once the session is closed
 
 ### 5.3 Transfer State Machine
 
@@ -2025,7 +2022,8 @@ Stored in each session directory, contains session information, sync progress, a
   "synced": 15,
   "channels": 2,
   "sample_rate": 16000,
-  "mode": "normal"
+  "mode": "normal",
+  "kind": "command"
 }
 ```
 
@@ -2037,6 +2035,7 @@ Stored in each session directory, contains session information, sync progress, a
 - `channels`: Audio channels (1=mono, 2=stereo)
 - `sample_rate`: Sample rate in Hz (e.g., 16000)
 - `mode`: Recording mode ("normal" or "enhanced")
+- `kind`: Capture kind ("command" or "note"), written when the session is created and kept when it is closed; absent in sessions from firmware before 0.1.4+3
 
 **Purpose:**
 - Track transfer progress for resume functionality
@@ -2142,25 +2141,25 @@ The device sends unsolicited notifications via the Response characteristic for i
 Sent when recording state changes (start, stop, pause, resume). Uses `"event":"state"` to distinguish from AT command responses.
 
 ```json
-{"event":"state","state":"RECORDING","session":"20240203100000"}
+{"event":"state","state":"RECORDING","session":"20240203100000","kind":"command"}
 ```
 
-**Trigger:** Recording starts (AT+START or button long press)
+**Trigger:** Capture is running (after a button tap or AT+START). Sent once the microphone, encoder and SD file are ready, together with the one-buzz start cue, not when the start is requested.
 
 ```json
-{"event":"state","state":"IDLE","session":"20240203100000","duration":600}
+{"event":"state","state":"IDLE","session":"20240203100000","kind":"command","duration":0,"frames":37}
 ```
 
-**Trigger:** Recording stops (AT+STOP or button long press). `duration` is in seconds.
+**Trigger:** The session is closed (button tap, AT+STOP, power-off, storage full or an audio error). Sent only after session.json and the files are final, so the session can be downloaded right away. `duration` is in whole seconds and rounds down: a short command can report `0`. Use `frames` (encoded 20 ms Opus frames) to tell whether there is audio; `0` means empty.
 
 ```json
-{"event":"state","state":"PAUSED","session":"20240203100000"}
+{"event":"state","state":"PAUSED","session":"20240203100000","kind":"note"}
 ```
 
 **Trigger:** Recording paused (AT+PAUSE)
 
 ```json
-{"event":"state","state":"RECORDING","session":"20240203100000"}
+{"event":"state","state":"RECORDING","session":"20240203100000","kind":"note"}
 ```
 
 **Trigger:** Recording resumed (AT+RESUME)
@@ -2169,13 +2168,17 @@ Sent when recording state changes (start, stop, pause, resume). Uses `"event":"s
 - `event`: Always `"state"` for state change events
 - `state`: New state — `"RECORDING"`, `"IDLE"`, or `"PAUSED"`
 - `session`: Session ID
-- `duration`: Recording duration in seconds (only present on stop/IDLE)
+- `kind`: Capture kind, `"command"` (button tap, `AT+START=command`) or `"note"` (`AT+START`, `AT+START=note`); also stored in session.json and `AT+LIST=<id>`. Firmware before 0.1.4+3 omits it.
+- `duration`: Recording duration in whole seconds (only on IDLE)
+- `frames`: Encoded audio frames (only on IDLE)
 
 **Notes:**
 - Sent on the Response Send characteristic (same as AT responses)
 - Distinguish from AT responses by checking for the `"event"` field
 - Not sent if BLE is not connected or notifications are not enabled
 - Triggered by both AT commands and button events
+- Every RECORDING for a new session is followed by exactly one IDLE for it. A start that is cancelled before its session exists (a second tap during startup, or an audio start failure) sends neither.
+- New fields may be added; ignore unknown fields.
 
 #### 7.1.2 Bookmark Mark Event
 
@@ -2185,7 +2188,7 @@ Sent when a bookmark is added during recording.
 {"event":"mark","session":"20240203100000","mark_count":3}
 ```
 
-**Trigger:** Bookmark added (AT+MARK or button short press)
+**Trigger:** Bookmark added (AT+MARK; the button no longer adds bookmarks)
 
 **Fields:**
 - `event`: Always `"mark"` for bookmark events
@@ -2669,46 +2672,36 @@ Client                            Device (192.168.4.1:8089)
 ```
 ## Appendix E: Button Events
 
-The device has a single user button (GPIO1.15, active-low) with multi-level press detection.
+The device has a single user button (GPIO1.15, active-low). Firmware 0.1.4+3 replaces the stock hold-to-record and 3 s power-off gestures with tap-to-toggle and an 8 s power-off hold. Thresholds are in the board DTS (`debounce-ms = <50>`, `long-press-ms = <1000 8000>`, `double-click-ms = <0>`).
 
 ### E.1 Button Actions
 
-| Action | Trigger | Behavior |
-|--------|---------|----------|
-| Single Click | Press & release (< 1s) | Context-dependent (see below) |
-| Long Press | Hold > 1s | Start/stop recording, confirm with vibration |
-| Long Press Level 1/2/3 | Continue holding > 2s/3s/4s | Power off screen (cancel on release) |
-| Release | Button released | Execute deferred action or power off |
-| Double Click | Two quick presses | Reserved (no action) |
+| Gesture | Trigger | Behavior |
+|---------|---------|----------|
+| Tap | Press 50 ms – 1 s, acted on at release | Toggle recording: start a `command` recording when idle; stop when starting, recording or paused |
+| Hold | Held ≥ 1 s, released before 8 s | Never toggles. Release shows the status bar |
+| Power-off hold | Held 8 s | Graceful shutdown at once (no release needed); all further input ignored |
 
-### E.2 Single Click Behavior
+Presses shorter than 50 ms are ignored (bounce or glitch). There is no double-click, marker or bookmark gesture; `AT+MARK` still adds bookmarks. A tap also restarts fast advertising when the Clip is not connected.
 
-| Current State | Action |
-|---------------|--------|
-| RECORDING | Add bookmark |
-| PAUSED | Add bookmark |
-| IDLE | Show status bar (timed) |
-| WIFI_SYNC | Show status bar (timed) |
-| ERROR | Show status bar (timed) |
+### E.2 Recording Toggle
 
-### E.3 Long Press Behavior
+- Start: the device buzzes **once when capture is actually ready** (microphone, encoder and SD file), then sends the `RECORDING` event. Speech after the buzz is recorded.
+- Stop: two buzzes right away; the `IDLE` event follows once the session is closed.
+- A tap while a recording is still starting stops it: the start is cancelled before any file exists, or the new session is closed at once. A tap while a stop is still closing the session is ignored, so the next start always gets a fresh, settled session.
+- Recording is refused while WiFi or USB mass storage is active, while the SD card is full, and during a firmware upgrade (all button input is ignored then).
 
-**Recording active:**
-1. At 1s hold → Stop recording immediately + vibrate
-2. Continue holding → Enter power-off flow
+### E.3 Power-Off Hold
 
-**Idle / Error / WiFi Sync:**
-1. At 1s hold → Vibrate to confirm threshold
-2. Continue holding → Enter power-off flow
-3. On release before power-off levels → Start recording
+1. At 1 s the hold is recognized (no toggle on release) and the fuel-gauge state is saved in the background.
+2. At 8 s the device stops any recording through the same settled path as a tap (the session is closed first), shows the power-off screen, buzzes twice and enters ship mode. Releasing the button afterwards does nothing.
+3. **Charging:** power-off is refused (the PMIC cannot enter ship mode with USB power). Releasing shows the status bar.
 
-**Charging:** Power-off is blocked. Long press levels are ignored.
+> **Bench build caveat (0.1.4+3):** the nPM1300 long-press hard reset (button = SHPHLD, about 7 s) is still enabled by default, so an 8 s hold can end in a PMIC power cycle at about 7 s instead of the graceful shutdown. That reset bypasses the recording close: an open recording may lose its tail. The app disables the PMIC reset only with `CONFIG_CLIP_PMIC_LONG_PRESS_RESET_DISABLE=y`, after the hardware watchdog has started, and reports the result as `lp_reset` in `AT+GSTAT`. That option stays off until watchdog recovery is proven on hardware.
 
-### E.4 Power-Off Flow
+### E.4 Watchdog
 
-1. Long press reaches Level 1 (> 2s hold) → Power-off screen displayed
-2. User releases button → Device enters ship mode (ultra-low power)
-3. If user releases before Level 1 → Action canceled, no power-off
+The application starts the nRF5340 hardware watchdog (WDT0, `CONFIG_CLIP_WDT_TIMEOUT_MS`, default 30 s) just before its main event loop. Only that loop feeds it, and only while the audio thread is settled or still making progress, so a hung event loop or a stuck recording resets the device. The watchdog keeps running across a soft reset (OTA reboot, `AT+REBOOT`, `AT+DFU`); MCUboot feeds it during an image copy and in serial recovery. An application that never feeds it (for example after rolling back to an official image by OTA) is reset once, about 30 s after it boots; the watchdog reset itself stops the watchdog.
 
 ### E.5 State Change Notifications
 
@@ -2716,9 +2709,8 @@ Button actions that change state send unsolicited notifications:
 
 | Action | Notification |
 |--------|-------------|
-| Start recording | `{"event":"state","state":"RECORDING",...}` |
-| Stop recording | `{"event":"state","state":"IDLE",...}` |
-| Add bookmark | `{"event":"mark","session":"...","mark_count":N}` |
+| Start recording (capture ready) | `{"event":"state","state":"RECORDING","session":"...","kind":"command"}` |
+| Stop recording (session closed) | `{"event":"state","state":"IDLE","session":"...","kind":"command","duration":N,"frames":N}` |
 
 
 ## Appendix F: Extending the Protocol — Adding a New AT Command
