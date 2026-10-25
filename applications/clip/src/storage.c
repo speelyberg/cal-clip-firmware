@@ -55,8 +55,7 @@ static storage_busy_cb_t sd_busy_cb;
 static uint8_t write_buffer[CONFIG_CLIP_STORAGE_CHUNK_SIZE];
 static uint32_t buffer_pos = 0;
 static struct fs_file_t *current_file_ptr = NULL;
-static uint8_t flushes_since_sync;  /* buffer flushes since the open file was last synced */
-static uint32_t sync_max_ms;        /* longest fs_sync of the open file (audio-stall check) */
+static uint32_t sync_max_ms;  /* longest storage_write_frame() call that synced (audio-stall check) */
 
 /* Statistics */
 static uint32_t total_chunks = 0;
@@ -701,7 +700,6 @@ int storage_write_chunk(const char *session_id, uint32_t chunk_index,
 /* Flush write buffer to SD card */
 static int flush_write_buffer(void)
 {
-    int rc;
     ssize_t written;
 
     if (buffer_pos == 0 || !current_file_ptr)
@@ -718,24 +716,6 @@ static int flush_write_buffer(void)
     }
 
     buffer_pos = 0;
-
-    /* FatFs writes the file's size and first cluster to its directory entry
-     * only on sync/close, so a reset (PMIC long-press, watchdog, brown-out)
-     * would leave the open segment at 0 bytes. Sync every 5th flush (~5 s at
-     * 32 kbps): a reset then loses at most the last ~5 s. A sync is 4 sector
-     * writes, well inside the 640 ms DMIC queue; sync_max_ms reports it. */
-    if (++flushes_since_sync >= 5)
-    {
-        flushes_since_sync = 0;
-        uint32_t t0 = k_uptime_get_32();
-
-        rc = fs_sync(current_file_ptr);
-        sync_max_ms = MAX(sync_max_ms, k_uptime_get_32() - t0);
-        if (rc != 0)
-        {
-            LOG_WRN("Periodic sync failed: %d", rc);
-        }
-    }
     return 0;
 }
 
@@ -795,7 +775,6 @@ int storage_create_file(struct storage_file *file, const char *session_id, uint3
     file->is_open = true;
     current_file_ptr = &file->internal_file;
     buffer_pos = 0;
-    flushes_since_sync = 0;
     sync_max_ms = 0;
 
     /* Mark this file as being written for transfer coordination */
@@ -809,6 +788,7 @@ int storage_write_frame(struct storage_file *file, const uint8_t *data, uint32_t
 {
     int rc;
     uint8_t frame_len[2];
+    uint32_t t0 = k_uptime_get_32();
 
     if (!sd_mounted || !file || !file->is_open)
     {
@@ -866,6 +846,31 @@ int storage_write_frame(struct storage_file *file, const uint8_t *data, uint32_t
     file->bytes_written += len + 2; /* +2 for length header */
     file->frames_written++;
     total_bytes += len + 2;
+
+    /* FatFs writes the file's size and first cluster to its directory entry
+     * only on sync/close, so a reset (PMIC long-press, watchdog, brown-out)
+     * would leave the open segment at 0 bytes. Sync every 250 frames (~5 s at
+     * 20 ms), right after a whole record: a reset then leaves a file that ends
+     * on a record boundary and loses at most the last ~5 s. The audio thread
+     * stalls for this whole call (any 4 KB write + this flush + the sync); it
+     * must fit the DMIC slack of about 600 ms (2 of the 32 slab blocks sit in
+     * the PDM DMA) minus one frame's DSP and encode time. Overflow stops the
+     * PDM until the 2x200 ms dmic_read timeout retrigger, losing about 1 s.
+     * sync_max_ms times the whole call. */
+    if (file->frames_written % 250 == 0)
+    {
+        rc = flush_write_buffer();  /* partial flush: the file now ends after this record */
+        if (rc != 0)
+        {
+            return rc;
+        }
+        rc = fs_sync(current_file_ptr);
+        sync_max_ms = MAX(sync_max_ms, k_uptime_get_32() - t0);
+        if (rc != 0)
+        {
+            LOG_WRN("Periodic sync failed: %d", rc);
+        }
+    }
 
     return 0;
 }
