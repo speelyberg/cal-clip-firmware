@@ -1099,7 +1099,10 @@ static void handle_event(enum ui_event event)
 	switch (event) {
 	case UI_EVENT_BOOT_LOGO:
 		/* Do not replace a recording, warning, or OTA screen if init was delayed. */
-		if (g_ui_state == UI_STATE_OFF && !g_recording) {
+		if (!g_recording && (g_ui_state == UI_STATE_OFF ||
+		    g_ui_state == UI_STATE_STATUS_BAR ||
+		    g_ui_state == UI_STATE_PAIRING_GUIDE ||
+		    g_ui_state == UI_STATE_USB_CONNECTED)) {
 			set_ui_state(UI_STATE_BOOT_LOGO);
 			k_work_reschedule(&display_timeout_work, K_SECONDS(2));
 			haptic_play_feedback(HAPTIC_DOUBLE);
@@ -1142,6 +1145,9 @@ static void handle_event(enum ui_event event)
 		break;
 
 	case UI_EVENT_STATUS_SHOW:
+		if (g_ui_state == UI_STATE_BOOT_LOGO) {
+			break; /* Startup charging notifications must not hide the splash. */
+		}
 		battery_poll();
 		if (!g_recording) {
 			if (g_ui_state == UI_STATE_OFF && !ble_is_bonded()) {
@@ -1184,6 +1190,9 @@ static void handle_event(enum ui_event event)
 		break;
 
 	case UI_EVENT_PAIRING_SHOW:
+		if (g_ui_state == UI_STATE_BOOT_LOGO) {
+			break; /* display_start_ui() checks the bond when the splash ends. */
+		}
 		k_work_cancel_delayable(&display_timeout_work);
 		set_ui_state(UI_STATE_PAIRING_GUIDE);
 		k_work_schedule(&display_timeout_work,
@@ -1196,7 +1205,7 @@ static void handle_event(enum ui_event event)
 
 	case UI_EVENT_USB_CONNECTED:
 		g_status.battery_charging = true;
-		if (!g_recording) {
+		if (!g_recording && g_ui_state != UI_STATE_BOOT_LOGO) {
 			set_ui_state(UI_STATE_USB_CONNECTED);
 			k_work_schedule(&display_timeout_work, K_MSEC(DISPLAY_STATUS_TIMEOUT_MS));
 		}
