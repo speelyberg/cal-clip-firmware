@@ -16,9 +16,10 @@
 		compatible = "gpio-button";
 		gpios = <&gpio1 15 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
 		label = "USR";
-		/* Tap-to-toggle: a press of 50 ms..1 s toggles recording (on
-		 * release; 50 ms = seen pressed on two 30 ms polls, so a motor/
-		 * EMI glitch can't toggle). 1 s marks a hold, which never
+		/* Tap-to-toggle: a press of ~30 ms..1 s toggles recording (on
+		 * release; 50 ms is checked on 30 ms polls, so it means seen
+		 * pressed on two polls: a glitch under ~30 ms can't toggle,
+		 * tools/cal/test_gpio_button.py). 1 s marks a hold, which never
 		 * toggles; 8 s powers off. No double-click (0 = no wait: the
 		 * tap is reported ~30 ms after release). The nPM1300 long-press
 		 * reset (~7 s, SHPHLD) still fires first unless the app has

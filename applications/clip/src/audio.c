@@ -13,6 +13,7 @@
 #include <zephyr/sys/byteorder.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 #include <math.h>
 #include <nrfx_pdm.h>
 #include <cmsis_core.h>
@@ -261,10 +262,12 @@ void audio_cleanup(void)
 
 int audio_start_recording(enum audio_mode mode, enum audio_kind kind)
 {
-    struct clip_context *c = clip_get_context();
-    uint16_t year;
-    uint8_t month, day, hour, min, sec;
-    int ret;
+    /* Last session second issued this boot (wall or uptime seconds) */
+    static int64_t last_id_sec = -1;
+    char path[STORAGE_PATH_MAX];
+    struct fs_dirent entry;
+    int64_t t;
+    bool wall;
 
     /* Lock to protect session_id and state variables */
     k_mutex_lock(&audio_state_mutex, K_FOREVER);
@@ -285,19 +288,41 @@ int audio_start_recording(enum audio_mode mode, enum audio_kind kind)
         opus_channels = 1;
     }
 
-    /* Generate session ID: always 14 digits */
-    if (clip_get_current_time(&year, &month, &day, &hour, &min, &sec)) {
-        /* Time synchronized: YYYYMMDDHHMMSS (14 digits) */
-        snprintf(current_session_id, sizeof(current_session_id),
-            "%04d%02d%02d%02d%02d%02d",
-            year, month, day, hour, min, sec);
-    } else {
-        /* Time not set: use 0 + uptime (14 digits total) */
-        uint32_t uptime_sec = (uint32_t)(k_uptime_get() / 1000);
-        snprintf(current_session_id, sizeof(current_session_id),
-            "0%013u", uptime_sec);
+    /* Session ID, always 14 digits and strictly increasing within a boot:
+     * a tap can start, cancel and start again inside one second (and the
+     * clock re-base at each stop drops the fraction). IDs already on the SD
+     * card are skipped too: the clock restarts from the last stop after a
+     * reset, so an earlier boot may have issued them. A reused ID would
+     * reopen the old session's files (FS_O_CREATE, no truncation). Rapid
+     * starts run the ID a few seconds ahead of the clock. */
+    wall = (config_get_time(&t) == 0);
+    if (!wall) {
+        t = k_uptime_get() / 1000;
         LOG_WRN("time unset, using uptime session id");
     }
+    for (t = MAX(t, last_id_sec + 1);; t++) {
+        if (wall) {
+            /* Time synchronized: YYYYMMDDHHMMSS */
+            struct tm tm;
+            time_t tt = (time_t)t;
+
+            gmtime_r(&tt, &tm);
+            snprintf(current_session_id, sizeof(current_session_id),
+                "%04d%02d%02d%02d%02d%02d", tm.tm_year + 1900, tm.tm_mon + 1,
+                tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+        } else {
+            /* Time not set: 0 + uptime seconds */
+            snprintf(current_session_id, sizeof(current_session_id),
+                "0%013u", (uint32_t)t);
+        }
+        if (storage_build_session_metadata_path(current_session_id, path,
+                                                sizeof(path)) != 0 ||
+            fs_stat(path, &entry) != 0) {
+            break;
+        }
+        LOG_WRN("session %s already on SD, skipping", current_session_id);
+    }
+    last_id_sec = t;
 
     /* Reset counters */
     current_kind = kind;
@@ -732,7 +757,7 @@ void audio_recording_thread(void *p1, void *p2, void *p3)
         /* Recording loop - process audio until stop requested */
         while (!stop_requested) {
             atomic_inc(&heartbeat);
-            if (atomic_get(&clip_wdt_hang) == 2) {
+            if (IS_ENABLED(CONFIG_CLIP_WDT_TEST) && atomic_get(&clip_wdt_hang) == 2) {
                 LOG_ERR("WDTTEST: audio thread hung");
                 k_sleep(K_FOREVER);
             }

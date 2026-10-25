@@ -162,6 +162,14 @@ class ButtonDriver(unittest.TestCase):
     def test_glitch_is_ignored(self):
         self.assertEqual(self.actions((1000, 1010)), [])
 
+    def test_effective_tap_threshold_is_two_polls(self):
+        # debounce-ms is compared on 30 ms polls: a press still down at the
+        # second poll measures 60 ms and toggles (docs/protocol.md E.1)
+        for ms, want in ((20, []), (29, []), (31, [CLICK]), (35, [CLICK]), (45, [CLICK]),
+                         (49, [CLICK])):
+            with self.subTest(press_ms=ms):
+                self.assertEqual(self.actions((1000, 1000 + ms)), want)
+
     def test_glitch_does_not_poison_the_next_press(self):
         # Stock left the glitch armed: the next tap was timed from it and read
         # as an instant long press (LONG_PRESS + RELEASE, no toggle).

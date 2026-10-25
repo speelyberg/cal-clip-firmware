@@ -640,7 +640,7 @@ Kconfig step to 0 restores the raw gauge value.
 | Release (after a hold) | Any | `CLIP_EVENT_STATUS_SHOW` |
 | Long press level 1 (8 s) | Not charging | `clip_request_shutdown()` at once, input locked |
 
-**Power-Off Sequence**: One step at 8 s, no release needed. The shutdown thread stops any recording through the settled audio lifecycle, shows the power-off screen and enters PMIC ship mode via `regulator_parent_ship_mode()`. Protocol Appendix E documents the gestures, and the ~7 s nPM1300 long-press reset that still precedes it unless `CONFIG_CLIP_PMIC_LONG_PRESS_RESET_DISABLE` is set.
+**Power-Off Sequence**: One step at 8 s, no release needed. The shutdown thread stops any recording through the settled audio lifecycle, shows the power-off screen and enters PMIC ship mode via `regulator_parent_ship_mode()`. Protocol Appendix E documents the gestures, and the ~7 s nPM1300 long-press reset that still precedes it unless `CONFIG_CLIP_PMIC_LONG_PRESS_RESET_DISABLE` is set; on USB power that reset lands in MCUboot serial recovery.
 
 ### 3.14 Display Controller (display.c)
 

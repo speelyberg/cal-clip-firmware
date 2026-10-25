@@ -448,7 +448,7 @@ void clip_main_loop(void)
         /* Process all pending events */
         clip_event_process();
         clip_wdt_feed();
-        if (atomic_get(&clip_wdt_hang) == 1) {
+        if (IS_ENABLED(CONFIG_CLIP_WDT_TEST) && atomic_get(&clip_wdt_hang) == 1) {
             LOG_ERR("WDTTEST: event loop hung");
             k_sleep(K_FOREVER);     /* last feed just now: reset in one timeout */
         }

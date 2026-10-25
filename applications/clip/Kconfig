@@ -120,19 +120,25 @@ config CLIP_PMIC_LONG_PRESS_RESET_DISABLE
 	  The PMIC power-cycles the board when the button (SHPHLD) is held
 	  about 7 s, before the 8 s graceful power-off. With this option the
 	  app turns that reset off after the watchdog has started, and reads
-	  the setting back. MCUboot restores it on every boot. TODO: keep this
+	  the setting back. MCUboot does not restore it; only a PMIC reset
+	  does (a soft or watchdog reset of the nRF5340 keeps it off).
+	  While it is on (this option n, the default), holding about 7 s on
+	  USB power power-cycles the board with the button down, so MCUboot
+	  enters USB serial recovery. TODO: keep this
 	  off until the watchdog-recovery hardware gate has passed (forced
 	  hangs recover, recovery to MCUboot proven); until then an 8 s hold
 	  may end in the PMIC hard reset instead of a graceful shutdown.
 
 config CLIP_WDT_TEST
 	bool "AT+WDTTEST bench hook (hang the event loop or the audio thread)"
-	default y
+	default y if LOG_BACKEND_UART
 	help
 	  Bench check of the watchdog: AT+WDTTEST=loop hangs the main event
 	  loop, AT+WDTTEST=audio hangs the audio thread of a running
-	  recording; the watchdog must then reset the device. On while the
-	  watchdog hardware gate is open; turn it off for a shipped image.
+	  recording; the watchdog must then reset the device. Debug builds
+	  only: like CLIP_LOG_FS_DEFAULT_ON it follows LOG_BACKEND_UART, which
+	  the production snippet turns off (a snippet cannot set CLIP_*
+	  symbols, it is broadcast to the MCUboot image too).
 
 config CLIP_SD_IDLE_DELAY_MS
 	int "SD card idle power-off delay (ms)"
