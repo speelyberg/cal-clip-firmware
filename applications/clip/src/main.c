@@ -378,6 +378,10 @@ static void clip_wdt_start(void)
         return;
     }
     LOG_INF("watchdog %d ms", CONFIG_CLIP_WDT_TIMEOUT_MS);
+    /* TODO: CONFIG_CLIP_PMIC_LONG_PRESS_RESET_DISABLE stays off (default)
+     * until the hardware gate passes: forced hangs recover through this
+     * watchdog and recovery to MCUboot is proven. Until then the ~7 s PMIC
+     * reset can preempt the 8 s graceful power-off (bench builds only). */
     if (IS_ENABLED(CONFIG_CLIP_PMIC_LONG_PRESS_RESET_DISABLE)) {
         pmic_long_press_reset_disable();
     }
