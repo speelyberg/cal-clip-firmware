@@ -167,6 +167,18 @@ for i in range(6):
 values.append(data[6] & 0x0F)         # 13th value (low nibble of last byte)
 ```
 
+#### 2.2.5 Live Opus Stream (Notify)
+
+**UUID**: `6E400006-B5A3-F393-E0A9-E50E24DCCA9E`
+**Properties**: Notify (encrypted link required; firmware 0.1.4+4 and later)
+**Max Length**: min(MTU - 3, 244)
+**Purpose**: Stream each recording's Opus records live while it is captured
+
+Versioned START / DATA / END packets carrying the same records as the SD
+file, with a final frame count, byte count, CRC-32 and overflow flag. The SD
+file remains authoritative; on any stream fault, download it after the
+session's IDLE event. Full specification: [stream_protocol.md](stream_protocol.md).
+
 ### 2.3 Connection Requirements
 
 **Advertised local name:** `Clip XXXX` — the literal string `Clip` followed by a

@@ -66,7 +66,7 @@ void stream_set_subscribed(bool on)
 void stream_begin(const char *session_id, uint8_t kind, uint8_t channels)
 {
 	uint64_t id = 0;
-	bool busy;
+	bool busy, live;
 
 	/* Session IDs are 14 decimal digits; sent as an integer so START fits
 	 * a 23-byte MTU. */
@@ -77,7 +77,8 @@ void stream_begin(const char *session_id, uint8_t kind, uint8_t channels)
 	k_spinlock_key_t key = k_spin_lock(&lock);
 
 	busy = s.subscribed && s.state != ST_IDLE;
-	if (s.subscribed && !busy) {
+	live = s.subscribed && !busy;
+	if (live) {
 		ring_buf_reset(&stream_ring);
 		s.state = ST_CAPTURE;
 		s.started = false;
@@ -97,22 +98,29 @@ void stream_begin(const char *session_id, uint8_t kind, uint8_t channels)
 		/* Previous session still draining: this one goes by file. */
 		LOG_WRN("stream busy, %s by file", session_id);
 	}
-	k_sem_give(&kick);
+	if (live) {
+		k_sem_give(&kick);
+	}
 }
 
 void stream_push(const uint8_t *frame, uint16_t len)
 {
 	uint8_t prefix[2];
+	uint32_t crc;
+	bool live;
 
 	sys_put_le16(len, prefix);
+	/* s.crc is written only by the audio thread (here, stream_begin), so
+	 * the CRC runs outside the interrupt lock. */
+	crc = crc32_ieee_update(crc32_ieee_update(s.crc, prefix, 2), frame, len);
 
 	k_spinlock_key_t key = k_spin_lock(&lock);
 
-	if (s.state == ST_CAPTURE) {
+	live = s.state == ST_CAPTURE;
+	if (live) {
 		s.frames++;
 		s.bytes += 2U + len;
-		s.crc = crc32_ieee_update(crc32_ieee_update(s.crc, prefix, 2),
-					  frame, len);
+		s.crc = crc;
 		if (!s.overflow && ring_buf_space_get(&stream_ring) >= 2U + len) {
 			ring_buf_put(&stream_ring, prefix, 2);
 			ring_buf_put(&stream_ring, frame, len);
@@ -121,18 +129,23 @@ void stream_push(const uint8_t *frame, uint16_t len)
 		}
 	}
 	k_spin_unlock(&lock, key);
-	k_sem_give(&kick);
+	if (live) {
+		k_sem_give(&kick);
+	}
 }
 
 void stream_end(void)
 {
 	k_spinlock_key_t key = k_spin_lock(&lock);
+	bool live = s.state == ST_CAPTURE;
 
-	if (s.state == ST_CAPTURE) {
+	if (live) {
 		s.state = ST_DRAIN;
 	}
 	k_spin_unlock(&lock, key);
-	k_sem_give(&kick);
+	if (live) {
+		k_sem_give(&kick);
+	}
 }
 
 /* Builds the next packet in session order into p (at most max bytes);
@@ -175,48 +188,53 @@ static size_t next_packet(uint8_t *p, size_t max, uint32_t *gen)
 	return n;
 }
 
-static void stream_sender(void *p1, void *p2, void *p3)
+/* Sends every packet that is due, in order; returns when none is. */
+static void stream_drain(void)
 {
 	static uint8_t pkt[PKT_MAX];
 
+	while (true) {
+		struct bt_conn *conn = ble_conn_ref();
+		uint32_t gen = 0;
+		size_t n = 0;
+		int err = 0;
+
+		if (conn) {
+			n = next_packet(pkt, MIN(bt_gatt_get_mtu(conn) - 3U,
+						 sizeof(pkt)), &gen);
+			if (n) {
+				/* Blocks only this thread, until an ATT
+				 * buffer frees or the link drops. */
+				err = ble_stream_notify(conn, pkt, n);
+			}
+			bt_conn_unref(conn);
+		}
+		if (!n) {
+			return;
+		}
+		if (err) {
+			/* No END follows: the relay uses the file. */
+			k_spinlock_key_t key = k_spin_lock(&lock);
+
+			if (s.gen == gen) {
+				s.state = ST_IDLE;
+				ring_buf_reset(&stream_ring);
+			}
+			k_spin_unlock(&lock, key);
+			LOG_WRN("stream notify %d, by file", err);
+		}
+	}
+}
+
+static void stream_sender(void *p1, void *p2, void *p3)
+{
 	ARG_UNUSED(p1);
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
 	while (true) {
 		k_sem_take(&kick, K_FOREVER);
-
-		while (true) {
-			struct bt_conn *conn = ble_conn_ref();
-			uint32_t gen = 0;
-			size_t n = 0;
-			int err = 0;
-
-			if (conn) {
-				n = next_packet(pkt, MIN(bt_gatt_get_mtu(conn) - 3U,
-							 sizeof(pkt)), &gen);
-				if (n) {
-					/* Blocks only this thread, until an
-					 * ATT buffer frees or the link drops. */
-					err = ble_stream_notify(conn, pkt, n);
-				}
-				bt_conn_unref(conn);
-			}
-			if (!n) {
-				break;
-			}
-			if (err) {
-				/* No END follows: the relay uses the file. */
-				k_spinlock_key_t key = k_spin_lock(&lock);
-
-				if (s.gen == gen) {
-					s.state = ST_IDLE;
-					ring_buf_reset(&stream_ring);
-				}
-				k_spin_unlock(&lock, key);
-				LOG_WRN("stream notify %d, by file", err);
-			}
-		}
+		stream_drain();
 	}
 }
 
