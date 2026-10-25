@@ -18,6 +18,7 @@ enum haptic_pattern {
 	HAPTIC_DOUBLE,         /* Double tap: 100ms on, 100ms off, 100ms on */
 	HAPTIC_LONG,           /* Long: 500ms on */
 	HAPTIC_ALERT,          /* Alert: 2 short, 1 long */
+	HAPTIC_TRIPLE,         /* Triple tap: 3x (100ms on, 100ms off) */
 };
 
 /**
@@ -46,6 +47,18 @@ int haptic_set_motor(bool enable);
  * @return 0 on success, negative error code on failure
  */
 int haptic_play_pattern(enum haptic_pattern pattern);
+
+/**
+ * @brief Queue a remote feedback pattern (AT+HAPTIC: command outcome).
+ *
+ * Unlike local cues, feedback must never buzz into a capture: it is refused
+ * while a recording is starting, running, paused or settling, and checked
+ * again before every pulse when it actually plays (abandoned if a capture
+ * has begun meanwhile).
+ *
+ * @return 0 if queued, -EBUSY while capturing, other negative on failure
+ */
+int haptic_play_feedback(enum haptic_pattern pattern);
 
 /**
  * @brief Check if motor is currently running

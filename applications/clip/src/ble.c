@@ -24,6 +24,11 @@
 
 LOG_MODULE_REGISTER(ble, CONFIG_CLIP_LOG_LEVEL);
 
+/* Owner-bond protection: with one key slot that is never reassigned, a peer
+ * other than the owner cannot pair (bt_keys_get_addr() finds no slot). */
+BUILD_ASSERT(!IS_ENABLED(CONFIG_BT_KEYS_OVERWRITE_OLDEST) &&
+	     CONFIG_BT_MAX_PAIRED == 1, "single, non-replaceable owner bond");
+
 /* BLE context */
 static struct ble_context ble_ctx = {
     .conn = NULL,
@@ -67,8 +72,9 @@ static uint8_t svc_uuid_bytes[16];
 /* Bond count before current connection (for detecting new pairing) */
 static int prev_bond_count;
 
-/* Work queue for advertising restart */
-static struct k_work adv_work;
+/* Advertising (re)start, retried with bounded backoff */
+static struct k_work_delayable adv_work;
+static uint8_t adv_retry;
 
 /* Track current advertising speed */
 static bool is_fast_adv;
@@ -113,25 +119,16 @@ static void security_request_handler(struct k_work *work)
         if (sec_err) {
             LOG_ERR("Security request failed: %d", sec_err);
             if (sec_err == -ENOMEM) {
-                /* Keys pool is full of stale/unloadable bonds. This happens
-                 * after an incompatible upgrade with
-                 * MAX_PAIRED=1: a bond for this peer exists in settings but
-                 * can't be loaded into the single RAM slot, which another
-                 * (stale) bond occupies -> bt_keys_get_addr() returns NULL.
-                 *
-                 * This path only runs for a peer we consider bonded (we only
-                 * request security for bonded peers); a stranger is not
-                 * bonded, never gets a security request, and so can never
-                 * reach here. So clearing here cannot be used to evict an
-                 * owner — it only drops bonds that are already unusable.
-                 * Clear them and disconnect so the peer re-pairs fresh. */
-                LOG_WRN("bond pool full, clearing stale");
-                (void)ble_clear_bonds();
+                /* No key slot for this peer: the single slot
+                 * (BT_MAX_PAIRED=1, overwrite-oldest off) holds the owner
+                 * bond and this peer is not the owner. connected() requests
+                 * security from EVERY peer, so clearing bonds here (as stock
+                 * did) let any stranger erase the owner. Refuse the peer and
+                 * keep the bond; owner-side recovery is AT+PAIR=reset. */
                 (void)bt_conn_disconnect(ble_ctx.conn,
                                          BT_HCI_ERR_REMOTE_USER_TERM_CONN);
             }
         } else {
-            LOG_INF("sec req sent");
             /* Start 10 second timeout for security establishment */
             k_work_schedule(&security_timeout_work, K_SECONDS(10));
         }
@@ -181,19 +178,13 @@ static void transfer_cancel_work_handler(struct k_work *work)
 static void le_param_updated(struct bt_conn *conn, uint16_t interval,
                              uint16_t latency, uint16_t timeout)
 {
+    /* Preferred parameters (15-30 ms, latency 0, 8 s supervision) come from
+     * CONFIG_BT_PERIPHERAL_PREF_* via Zephyr's automatic update ~5 s after
+     * connect. Stock re-requested them here, but only when an update landed
+     * before the 1 s MTU exchange; normally the 420 ms default PREF won. */
+    LOG_INF("conn int=%u lat=%u to=%u", interval, latency, timeout);
     if (!mtu_exchanged && ble_ctx.conn == conn) {
         bt_gatt_exchange_mtu(conn, &mtu_params);
-        /* After MTU exchange, request faster connection parameters */
-        /* Coexistence-friendly params: moderate interval + long supervision
-         * timeout (8s) so a WiFi-AP cold start (~8s) doesn't supervise the
-         * BLE link out. Was interval=6/timeout=500 -> disconnects on WiFi-on. */
-        struct bt_le_conn_param fast_params = {
-            .interval_min = 15,
-            .interval_max = 30,
-            .latency = 0,
-            .timeout = 800,
-        };
-        bt_conn_le_param_update(conn, &fast_params);
     }
 }
 
@@ -202,12 +193,12 @@ static bool le_param_req(struct bt_conn *conn, struct bt_le_conn_param *param)
 {
     /* Require a coexistence-friendly minimum so WiFi AP bring-up (~5-8s,
      * monopolizes the radio) can't supervise the link out. */
-    if (param->timeout < 800) {
+    if (param->timeout < CONFIG_BT_PERIPHERAL_PREF_TIMEOUT) {
         LOG_WRN("Clamping conn params: timeout %u", param->timeout);
-        param->timeout = 800;
-        param->interval_min = 30;
-        param->interval_max = 50;
-        param->latency = 0;
+        param->timeout = CONFIG_BT_PERIPHERAL_PREF_TIMEOUT;
+        param->interval_min = CONFIG_BT_PERIPHERAL_PREF_MIN_INT;
+        param->interval_max = CONFIG_BT_PERIPHERAL_PREF_MAX_INT;
+        param->latency = CONFIG_BT_PERIPHERAL_PREF_LATENCY;
         return true; /* accept the clamped counter-proposal (false = reject) */
     }
 
@@ -312,6 +303,28 @@ static void generate_device_name(void)
     LOG_INF("Device name: %s", ble_ctx.device_name);
 }
 
+/* Start connectable advertising. Any failure (e.g. -ENOMEM while the
+ * previous connection object is still held) is retried by adv_work with
+ * bounded backoff (100 ms doubling to 6.4 s), so the device never goes
+ * dark. Returns true if advertising was started by this call. */
+static bool adv_start(const struct bt_le_adv_param *param)
+{
+	int err = bt_le_adv_start(param, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+
+	if (err == 0) {
+		is_fast_adv = (param == &adv_param_fast);
+	} else if (err != -EALREADY) {
+		LOG_ERR("adv start %d", err);
+		k_work_reschedule(&adv_work, K_MSEC(100U << adv_retry));
+		if (adv_retry < 6) {
+			adv_retry++;
+		}
+		return false;
+	}
+	adv_retry = 0;
+	return err == 0;
+}
+
 /* Advertising fast→slow timeout handler */
 static void adv_timeout_handler(struct k_work *work)
 {
@@ -330,13 +343,8 @@ static void adv_timeout_handler(struct k_work *work)
 	}
 
 	LOG_INF("slow adv");
-	is_fast_adv = false;
 	bt_le_adv_stop();
-	int err = bt_le_adv_start(&adv_param_slow, ad, ARRAY_SIZE(ad),
-				  sd, ARRAY_SIZE(sd));
-	if (err && err != -EALREADY) {
-		LOG_ERR("Slow advertising start failed: %d", err);
-	}
+	(void)adv_start(&adv_param_slow);
 }
 
 /* BLE inactivity timeout handler - disconnect after 5 minutes idle */
@@ -348,22 +356,23 @@ static void inactivity_timeout_handler(struct k_work *work)
 	}
 }
 
-/* Advertising restart handler */
+/* Advertising restart handler: runs once the stack has recycled the last
+ * connection object (BT_LE_ADV_OPT_CONN is one-shot, so nothing else
+ * restarts advertising), and as the retry for any failed start. */
 static void adv_work_handler(struct k_work *work)
 {
-	int err;
-	const struct bt_le_adv_param *param = ble_is_bonded()
-		? &adv_param_slow : &adv_param_fast;
-
-	err = bt_le_adv_start(param, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
-	if (err && err != -EALREADY) {
-		LOG_ERR("Advertising restart failed: %d", err);
-	} else {
+	if (!ble_is_connected() &&
+	    adv_start(ble_is_bonded() ? &adv_param_slow : &adv_param_fast) &&
+	    is_fast_adv) {
 		/* Schedule switch to slow advertising after timeout */
 		k_work_reschedule(&adv_timeout_work,
 				  K_MSEC(ADV_FAST_TIMEOUT_MS));
-		is_fast_adv = true;
 	}
+}
+
+static void conn_recycled(void)
+{
+	k_work_reschedule(&adv_work, K_NO_WAIT);
 }
 
 /* Bond count callback for checking existing bonds */
@@ -468,8 +477,8 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
             k_work_submit(&transfer_cancel_work);
         }
 
-        /* Restart advertising via work queue */
-        k_work_submit(&adv_work);
+        /* Advertising restarts from conn_recycled(): here the stack still
+         * holds this connection object, so a connectable start would fail. */
     }
 }
 
@@ -532,10 +541,7 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
 /* Auto-confirm Just Works pairing */
 static void pairing_confirm(struct bt_conn *conn)
 {
-	char addr[BT_ADDR_LE_STR_LEN];
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-	LOG_INF("Pairing confirm: %s", addr);
+	/* (narration log trimmed for flash headroom; pairing_complete logs) */
 	bt_conn_auth_pairing_confirm(conn);
 }
 
@@ -552,12 +558,9 @@ static void pairing_complete(struct bt_conn *conn, bool bonded)
     LOG_INF("paired: %s b=%d", addr, bonded);
 
     if (bonded) {
-        LOG_INF("saving bond keys");
         int err = settings_save();
         if (err) {
             LOG_WRN("settings_save after pairing failed: %d", err);
-        } else {
-            LOG_INF("keys saved");
         }
 
         /* Check if this is a new device (bond count increased) */
@@ -591,6 +594,7 @@ static struct bt_conn_cb conn_callbacks = {
     .le_param_updated = le_param_updated,
     .le_param_req = le_param_req,
     .security_changed = security_changed,
+    .recycled = conn_recycled,
 };
 
 /* Write callback for command receive */
@@ -659,7 +663,7 @@ int ble_init(void)
     sd[0].data = svc_uuid_bytes;
 
     /* Initialize work queues */
-    k_work_init(&adv_work, adv_work_handler);
+    k_work_init_delayable(&adv_work, adv_work_handler);
     k_work_init_delayable(&security_timeout_work, security_timeout_handler);
     k_work_init_delayable(&security_request_work, security_request_handler);
     k_work_init_delayable(&mtu_work, mtu_work_handler);
@@ -693,16 +697,10 @@ int ble_init(void)
     }
 
     /* Start advertising - always fast initially */
-    err = bt_le_adv_start(&adv_param_fast, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
-    if (err) {
-        if (err != -EALREADY) {
-            LOG_ERR("Advertising start failed: %d", err);
-        }
-    }
+    (void)adv_start(&adv_param_fast);
 
     /* Schedule switch to slow advertising (stays fast if unbonded) */
     k_work_schedule(&adv_timeout_work, K_MSEC(ADV_FAST_TIMEOUT_MS));
-    is_fast_adv = true;
 
 
     return 0;
@@ -1018,13 +1016,8 @@ void ble_adv_restart_fast(void)
     }
 
     bt_le_adv_stop();
-    int err = bt_le_adv_start(&adv_param_fast, ad, ARRAY_SIZE(ad),
-				      sd, ARRAY_SIZE(sd));
-    if (err && err != -EALREADY) {
-	LOG_ERR("Fast advertising restart failed: %d", err);
-    } else {
+    if (adv_start(&adv_param_fast)) {
 	LOG_INF("fast adv (button)");
-	is_fast_adv = true;
     }
 
     /* Re-schedule switch to slow advertising */

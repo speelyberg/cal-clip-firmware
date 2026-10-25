@@ -87,6 +87,11 @@ static K_SEM_DEFINE(audio_start_sem, 0, 1);
 /* Mutex for protecting recording state */
 static K_MUTEX_DEFINE(audio_state_mutex);
 
+/* Set when a start is accepted; cleared only once the audio thread is back
+ * waiting with no start pending (start skipped/failed, or stop cleanup
+ * done). Spans starting, recording, paused and stopping. */
+static atomic_t capture_busy;
+
 /* Stop request flag */
 static volatile bool stop_requested = false;
 
@@ -299,6 +304,7 @@ int audio_start_recording(enum audio_mode mode)
     k_sem_reset(&stop_done_sem);
 
     /* Wake up audio thread by giving semaphore */
+    atomic_set(&capture_busy, 1);
     k_sem_give(&audio_start_sem);
     k_mutex_unlock(&audio_state_mutex);
 
@@ -369,6 +375,11 @@ int audio_resume_recording(void)
 
     LOG_INF("Recording resume requested");
     return 0;
+}
+
+bool audio_capture_busy(void)
+{
+    return atomic_get(&capture_busy) != 0;
 }
 
 bool audio_is_recording(void)
@@ -657,6 +668,14 @@ void audio_recording_thread(void *p1, void *p2, void *p3)
     ARG_UNUSED(p3);
 
     while (true) {
+        /* Settled. Checked under the lock audio_start_recording() holds
+         * while it sets capture_busy and gives the semaphore. */
+        k_mutex_lock(&audio_state_mutex, K_FOREVER);
+        if (k_sem_count_get(&audio_start_sem) == 0) {
+            atomic_set(&capture_busy, 0);
+        }
+        k_mutex_unlock(&audio_state_mutex);
+
         /* Wait for start signal (blocks here) */
         k_sem_take(&audio_start_sem, K_FOREVER);
 

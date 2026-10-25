@@ -118,6 +118,12 @@ bool audio_is_paused(void);
 bool audio_is_recording(void);
 
 /**
+ * @brief True from an accepted start until the audio thread has fully
+ *        settled again: starting, recording, paused and stopping.
+ */
+bool audio_capture_busy(void);
+
+/**
  * @brief Get audio statistics
  *
  * @param stats Output statistics structure

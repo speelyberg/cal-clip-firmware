@@ -9,6 +9,8 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/logging/log.h>
 #include "haptic.h"
+#include "audio.h"
+#include "clip_event.h"
 
 LOG_MODULE_REGISTER(haptic, CONFIG_CLIP_LOG_LEVEL);
 
@@ -52,7 +54,56 @@ static K_TIMER_DEFINE(haptic_motor_guard, haptic_motor_guard_fn, NULL);
 /* Pattern execution moved to a dedicated low-priority thread: patterns are
  * on/off timing loops (100-500 ms of k_sleep), and callers (button driver
  * thread, clip event handler) must not be stalled while the motor runs. */
-K_MSGQ_DEFINE(haptic_msgq, sizeof(enum haptic_pattern), 4, 1);
+struct haptic_req {
+	uint8_t pattern;
+	bool feedback;          /* remote feedback: gated on capture state */
+};
+K_MSGQ_DEFINE(haptic_msgq, sizeof(struct haptic_req), 4, 1);
+
+/* Requests queued or executing. Unlike the queue depth this also covers the
+ * motor-off gaps inside a multi-pulse pattern, which audio must wait out. */
+static atomic_t haptic_pending;
+
+/* Haptic thread only: the pattern being played is remote feedback */
+static bool feedback_gated;
+
+/* Remote feedback must stay out of captures (starting, recording, paused,
+ * settling). */
+static bool capture_quiet(void)
+{
+	enum clip_state state = clip_event_get_state();
+
+	return state != CLIP_STATE_RECORDING && state != CLIP_STATE_PAUSED &&
+	       !audio_capture_busy();
+}
+
+static int haptic_enqueue(enum haptic_pattern pattern, bool feedback)
+{
+	struct haptic_req req = { .pattern = pattern, .feedback = feedback };
+	int err;
+
+	atomic_inc(&haptic_pending);
+	err = k_msgq_put(&haptic_msgq, &req, K_NO_WAIT);
+	if (err) {
+		atomic_dec(&haptic_pending);
+	}
+	return err;
+}
+
+/* One motor pulse. Feedback is re-checked before every pulse, at the moment
+ * it would actually play; false = abandoned because a capture began. */
+static bool pulse(int32_t on_ms, int32_t off_ms)
+{
+	if (feedback_gated && !capture_quiet()) {
+		LOG_INF("haptic feedback dropped");
+		return false;
+	}
+	haptic_set_motor(true);
+	k_sleep(K_MSEC(on_ms));
+	haptic_set_motor(false);
+	k_sleep(K_MSEC(off_ms));
+	return true;
+}
 
 #define HAPTIC_THREAD_STACK_SIZE 1024
 static K_THREAD_STACK_DEFINE(haptic_stack, HAPTIC_THREAD_STACK_SIZE);
@@ -60,15 +111,17 @@ static struct k_thread haptic_thread;
 
 static void haptic_thread_fn(void *p1, void *p2, void *p3)
 {
-	enum haptic_pattern pattern;
+	struct haptic_req req;
 
 	ARG_UNUSED(p1);
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
 	while (1) {
-		k_msgq_get(&haptic_msgq, &pattern, K_FOREVER);
-		(void)execute_pattern(pattern);
+		k_msgq_get(&haptic_msgq, &req, K_FOREVER);
+		feedback_gated = req.feedback;
+		(void)execute_pattern(req.pattern);
+		atomic_dec(&haptic_pending);
 	}
 }
 
@@ -135,7 +188,7 @@ bool haptic_is_busy(void)
 #ifdef CONFIG_CLIP_HAPTIC_MOTOR_ENABLED
 	/* A queued or running pattern counts: the motor's mechanical noise
 	 * couples into the PDM mics, so audio capture must wait it out. */
-	return k_msgq_num_used_get(&haptic_msgq) > 0 || motor_is_on;
+	return atomic_get(&haptic_pending) > 0 || motor_is_on;
 #else
 	return false;
 #endif
@@ -154,49 +207,26 @@ bool haptic_is_running(void)
 static int execute_pattern(enum haptic_pattern pattern)
 {
 #ifdef CONFIG_CLIP_HAPTIC_MOTOR_ENABLED
+	LOG_DBG("Haptic: %d", pattern);
 	switch (pattern) {
-	case HAPTIC_SHORT:
-		/* Short tap: 100ms */
-		LOG_DBG("Haptic: SHORT");
-		haptic_set_motor(true);
-		k_sleep(K_MSEC(100));
-		haptic_set_motor(false);
+	case HAPTIC_SHORT:      /* Short tap: 100ms */
+		(void)pulse(100, 0);
 		break;
 
-	case HAPTIC_DOUBLE:
-		/* Double tap: 100ms on, 100ms off, 100ms on */
-		LOG_DBG("Haptic: DOUBLE");
-		haptic_set_motor(true);
-		k_sleep(K_MSEC(100));
-		haptic_set_motor(false);
-		k_sleep(K_MSEC(100));
-		haptic_set_motor(true);
-		k_sleep(K_MSEC(100));
-		haptic_set_motor(false);
+	case HAPTIC_DOUBLE:     /* Double tap: 100ms on, 100ms off, 100ms on */
+		(void)(pulse(100, 100) && pulse(100, 0));
 		break;
 
-	case HAPTIC_LONG:
-		/* Long: 500ms on */
-		LOG_DBG("Haptic: LONG");
-		haptic_set_motor(true);
-		k_sleep(K_MSEC(500));
-		haptic_set_motor(false);
+	case HAPTIC_TRIPLE:     /* Triple tap: three short taps */
+		(void)(pulse(100, 100) && pulse(100, 100) && pulse(100, 0));
 		break;
 
-	case HAPTIC_ALERT:
-		/* Alert: 2 short, 1 long */
-		LOG_DBG("Haptic: ALERT");
-		haptic_set_motor(true);
-		k_sleep(K_MSEC(150));
-		haptic_set_motor(false);
-		k_sleep(K_MSEC(150));
-		haptic_set_motor(true);
-		k_sleep(K_MSEC(150));
-		haptic_set_motor(false);
-		k_sleep(K_MSEC(150));
-		haptic_set_motor(true);
-		k_sleep(K_MSEC(400));
-		haptic_set_motor(false);
+	case HAPTIC_LONG:       /* Long: 500ms on */
+		(void)pulse(500, 0);
+		break;
+
+	case HAPTIC_ALERT:      /* Alert: 2 short, 1 long */
+		(void)(pulse(150, 150) && pulse(150, 150) && pulse(400, 0));
 		break;
 
 	default:
@@ -216,7 +246,19 @@ int haptic_play_pattern(enum haptic_pattern pattern)
 	/* Non-blocking: queue for the haptic thread (drops if one is already
 	 * queued — feedback patterns are idempotent-ish, a dropped duplicate
 	 * is fine). */
-	return k_msgq_put(&haptic_msgq, &pattern, K_NO_WAIT);
+	return haptic_enqueue(pattern, false);
+#else
+	return -ENOTSUP;
+#endif
+}
+
+int haptic_play_feedback(enum haptic_pattern pattern)
+{
+#ifdef CONFIG_CLIP_HAPTIC_MOTOR_ENABLED
+	if (!capture_quiet()) {
+		return -EBUSY;
+	}
+	return haptic_enqueue(pattern, true);
 #else
 	return -ENOTSUP;
 #endif

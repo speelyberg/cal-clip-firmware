@@ -627,6 +627,34 @@ static int cmd_brightness_handler(struct at_cmd_ctx *ctx, char *response, size_t
     }
 }
 
+/* HAPTIC Command Handler - AT+HAPTIC=<short|double|triple|long>
+ * Command-outcome feedback from the relay. Refused while a recording is
+ * starting, running, paused or stopping (motor noise would be captured);
+ * haptic.c re-checks before each pulse when the pattern actually plays. */
+static int cmd_haptic_handler(struct at_cmd_ctx *ctx, char *response, size_t len)
+{
+    static const char *const names[] = {
+        [HAPTIC_SHORT] = "short",
+        [HAPTIC_DOUBLE] = "double",
+        [HAPTIC_TRIPLE] = "triple",
+        [HAPTIC_LONG] = "long",
+    };
+
+    for (size_t i = 0; ctx->args && i < ARRAY_SIZE(names); i++) {
+        if (names[i] && strcmp(ctx->args, names[i]) == 0) {
+            int err = haptic_play_feedback((enum haptic_pattern)i);
+
+            if (err == -EBUSY) {
+                return -AT_ERR_STATE;   /* capturing: retry once IDLE */
+            }
+            /* Other failures (queue full) are transient too */
+            return create_json_response(err == 0, err ? "Busy" : NULL, NULL,
+                                        response, len);
+        }
+    }
+    return -AT_ERR_PARAM;
+}
+
 /* POWEROFF Command Handler - Shutdown the device */
 static int cmd_poweroff_handler(struct at_cmd_ctx *ctx, char *response, size_t len)
 {
@@ -2055,6 +2083,15 @@ int at_commands_register(void)
         .handler = cmd_usb_handler,
     };
     err = at_server_register_cmd(&usb_cmd);
+    if (err) return err;
+
+    /* HAPTIC - command-outcome feedback (AT+HAPTIC=short|double|triple|long) */
+    static const struct at_command haptic_cmd = {
+        .name = "HAPTIC",
+        .flags = AT_CMD_SET,
+        .handler = cmd_haptic_handler,
+    };
+    err = at_server_register_cmd(&haptic_cmd);
     if (err) return err;
 
     /* LOG - control FS (SD) log backend (AT+LOG=off|info|debug) */

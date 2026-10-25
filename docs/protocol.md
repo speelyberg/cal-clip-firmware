@@ -179,7 +179,8 @@ space and 4 hex digits of the nRF5340 FICR DEVICEID low 16 bits (e.g.
 | Bonding | Required (stored for auto-reconnect, single bond) |
 | Encryption | AES-128 CCM, level 2 (mandatory) |
 | MTU | Negotiated up to 517 (default 23) |
-| Connection Interval | 15-80 ms (adaptive) |
+| Connection Parameters | Preferred 15-30 ms interval, latency 0, 8 s supervision timeout (GAP PPCP; requested automatically ~5 s after connect). Central requests with a shorter supervision timeout are countered with these values. SMP/OTA transfers temporarily request 7.5-11.25 ms, still with 8 s supervision. |
+| SMP (mcumgr OTA) | Encrypted link required (`CONFIG_MCUMGR_TRANSPORT_BT_PERM_RW_ENCRYPT`) |
 
 **Pairing/association model (what a client should expect):**
 
@@ -191,12 +192,19 @@ space and 4 hex digits of the nRF5340 FICR DEVICEID low 16 bits (e.g.
   comparison callbacks), so the association method is **Just Works** over LE
   Secure Connections (when the central supports it). There is no PIN to enter
   and no user confirmation number.
-- Pairing is **bondable with a single bond slot** (`CONFIG_BT_BONDABLE=y`,
-  `CONFIG_BT_MAX_PAIRED=1`, `CONFIG_BT_KEYS_OVERWRITE_OLDEST=y`); keys persist
-  in settings. On reconnect the device re-encrypts with the stored LTK and
-  disconnects the link if encryption is not reached (level < 2 or pairing
-  error), so a client that deleted its bond will be disconnected and must
-  re-pair.
+- Pairing is **bondable with a single owner bond** (`CONFIG_BT_BONDABLE=y`,
+  `CONFIG_BT_MAX_PAIRED=1`, `CONFIG_BT_KEYS_OVERWRITE_OLDEST=n` in every
+  build); keys persist in settings. On reconnect the device re-encrypts with
+  the stored LTK and disconnects the link if encryption is not reached
+  (level < 2 or pairing error).
+- While an owner bond exists, any other central is disconnected as soon as
+  its security request or pairing attempt fails for lack of a key slot; the
+  owner bond is never cleared on its behalf. To pair a different central,
+  the owner (or USB) must send `AT+PAIR=reset` first (this also erases the
+  SD card).
+- Owner recovery stays scoped to the owner: if the owner itself deleted its
+  bond and re-pairs, the device drops only that peer's stale keys and
+  disconnects; the owner pairs fresh on the next connection.
 
 ### 2.4 MTU Negotiation
 
@@ -242,6 +250,7 @@ Set configuration or execute with parameters:
 - `AT+MODE=<normal|enhanced>` - Set recording mode (`AT+START=<mode>` additionally accepts the legacy aliases `stereo`/`merge`)
 - `AT+AUTODEL=<off|0|1-30>` - Set auto-delete policy
 - `AT+BRIGHTNESS=<0-255>` - Set OLED brightness
+- `AT+HAPTIC=<short|double|triple|long>` - Play command-outcome feedback
 - `AT+TIME=<unix_ts>` - Set system time
 - `AT+PAIR=<reset>` - Reset BLE pairing
 - `AT+FACTORY=<confirm>` - Factory reset
@@ -1106,6 +1115,49 @@ AT+BRIGHTNESS?
 
 **Error Cases:**
 - `{"ok":false,"msg":"Brightness must be 0-255"}` / `"Invalid brightness"` / `"Missing brightness value"`
+
+---
+
+##### AT+HAPTIC - Command-Outcome Feedback
+
+Plays a vibration pattern so a host (e.g. a voice relay) can report the
+result of a command: `short` = success, `triple` = failed or unconfirmed.
+Firmware without this command answers `{"ok":false,"msg":"Unknown command"}`,
+which a host should treat as "feedback not supported".
+
+**Request (Set only):**
+```
+AT+HAPTIC=<pattern>
+```
+
+**Parameters:**
+- `pattern` (exact, lowercase):
+  - `short` - one 100 ms pulse
+  - `double` - two 100 ms pulses, 100 ms apart
+  - `triple` - three 100 ms pulses, 100 ms apart
+  - `long` - one 500 ms pulse
+
+**Response (accepted, pattern queued):**
+```json
+{"ok":true}
+```
+
+**Capture guard:** the motor's noise couples into the microphones, so the
+command is refused while a recording is starting, recording, paused or
+stopping (until the audio pipeline has fully settled). A pattern accepted
+while idle is checked again before every pulse as it plays; if a recording
+has started in the meantime the rest of the pattern is silently dropped.
+`ok:true` therefore means "queued", not "felt". Send feedback only after the
+`IDLE` state event and retry later on `Invalid state`.
+
+**Error Cases:**
+- `{"ok":false,"msg":"Invalid state"}` - a recording is starting, active, paused or stopping; retry once idle
+- `{"ok":false,"msg":"Busy"}` - haptic queue full; retry shortly
+- `{"ok":false,"msg":"Invalid parameter"}` - missing or unknown pattern
+- `{"ok":false,"msg":"QUERY not supported"}` / `"EXEC not supported"` - use the `=<pattern>` form
+
+Over BLE the command characteristic already requires an encrypted (bonded)
+link.
 
 ---
 
@@ -2210,6 +2262,7 @@ These message strings appear across commands (exact text from the handlers):
 | `Brightness must be 0-255` | `AT+BRIGHTNESS` out of range |
 | `Auto-delete must be 0-30 days or off` | Bad `AT+AUTODEL` value |
 | `Log mode must be off, info or debug` | Bad `AT+LOG` value |
+| `Invalid state` | `AT+HAPTIC` while a recording is starting, active, paused or stopping |
 | `Cannot format while recording` | `AT+FORMAT` while recording |
 | `Recording in progress, stop first` | `AT+USB`/`AT+WIFI` blocked by active recording |
 | `Cannot start WiFi in current state` | `AT+WIFI=on` while recording/transferring |
@@ -2375,6 +2428,7 @@ To prevent BLE congestion:
 | AT+REBOOT | EXEC | Reboot | 3.3.7 |
 | AT+NAME | GET/SET | User device name (≤256 bytes) | 3.3.7 |
 | AT+LOG | GET/SET | SD log backend (off/info/debug) | 3.3.7 |
+| AT+HAPTIC | SET | Command-outcome vibration (short/double/triple/long) | 3.3.7 |
 | AT+DFU | EXEC | Reboot into MCUboot DFU/recovery | 3.3.7 |
 | AT+WIFICFG | GET/SET | WiFi channel / reg domain | 3.3.7 |
 
