@@ -45,15 +45,18 @@ LOG_MODULE_REGISTER(clip_event, LOG_LEVEL_WRN); /* chatty event-flow logs */
 /*
  * transition_table[current_state][event] = next_state
  *
- * STOP keeps RECORDING/PAUSED: the state turns IDLE only when the audio
- * thread reports SETTLED (audio_news_process), so RECORDING spans the whole
- * STARTING..STOPPING lifecycle and a new START waits for the old session.
+ * STOP never changes the state and is accepted in every state: its handler
+ * checks the audio lifecycle itself, so a coarse state that disagrees with
+ * the audio thread can't block a stop. RECORDING/PAUSED turn IDLE only when
+ * the audio thread reports SETTLED (audio_news_process): RECORDING spans the
+ * whole STARTING..STOPPING lifecycle and a new START waits for the old
+ * session.
  *
  *                  START  STOP   PAUSE  RESUME MARK   WIFI_ON WIFI_OFF HOLD   POFF_E STATUS USB   OTA_S OTA_D
  */
 static const uint8_t transition_table[CLIP_STATE_OTA + 1][CLIP_EVENT_COUNT] = {
-    /* UNINITIALIZED */ { 0, 0, 0, 0, 0, 0, 0, TRANS_SAME, TRANS_SAME, 0,    0,    0,    0 },
-    /* IDLE          */ { CLIP_STATE_RECORDING, 0, 0, 0, 0,
+    /* UNINITIALIZED */ { 0, TRANS_SAME, 0, 0, 0, 0, 0, TRANS_SAME, TRANS_SAME, 0, 0, 0, 0 },
+    /* IDLE          */ { CLIP_STATE_RECORDING, TRANS_SAME, 0, 0, 0,
                          CLIP_STATE_WIFI_SYNC, 0,
                          TRANS_SAME, TRANS_SAME, TRANS_SAME,
                          TRANS_SAME, TRANS_SAME, TRANS_SAME },
@@ -61,11 +64,11 @@ static const uint8_t transition_table[CLIP_STATE_OTA + 1][CLIP_EVENT_COUNT] = {
                          TRANS_SAME, 0, 0,
                          TRANS_SAME, TRANS_SAME, 0,
                          TRANS_SAME, TRANS_SAME, TRANS_SAME },
-    /* TRANSMITTING  */ { 0, 0, 0, 0, 0,
+    /* TRANSMITTING  */ { 0, TRANS_SAME, 0, 0, 0,
                          CLIP_STATE_WIFI_SYNC, 0,
                          TRANS_SAME, TRANS_SAME, 0,
                          TRANS_SAME, TRANS_SAME, TRANS_SAME },
-    /* WIFI_SYNC     */ { 0, 0, 0, 0, 0,
+    /* WIFI_SYNC     */ { 0, TRANS_SAME, 0, 0, 0,
                          TRANS_SAME,
                          CLIP_STATE_IDLE, TRANS_SAME, TRANS_SAME, TRANS_SAME,
                          TRANS_SAME, TRANS_SAME, TRANS_SAME },
@@ -74,11 +77,11 @@ static const uint8_t transition_table[CLIP_STATE_OTA + 1][CLIP_EVENT_COUNT] = {
                          CLIP_STATE_WIFI_SYNC, 0,
                          TRANS_SAME, TRANS_SAME, 0,
                          TRANS_SAME, TRANS_SAME, TRANS_SAME },
-    /* ERROR         */ { CLIP_STATE_IDLE, 0, 0, 0, 0,
+    /* ERROR         */ { CLIP_STATE_IDLE, TRANS_SAME, 0, 0, 0,
                          CLIP_STATE_WIFI_SYNC, 0,
                          TRANS_SAME, TRANS_SAME, TRANS_SAME,
                          TRANS_SAME, TRANS_SAME, TRANS_SAME },
-    /* OTA           */ { 0, 0, 0, 0, 0,
+    /* OTA           */ { 0, TRANS_SAME, 0, 0, 0,
                          CLIP_STATE_WIFI_SYNC, 0,
                          TRANS_SAME, TRANS_SAME, TRANS_SAME,
                          0, TRANS_SAME, CLIP_STATE_IDLE },
@@ -779,6 +782,9 @@ static enum clip_event_result execute_transition(enum clip_event event,
 
     case CLIP_EVENT_RESUME:
     {
+        if (!audio_is_capturing()) {
+            return CLIP_EVENT_INVALID;      /* stopping */
+        }
         /* Buzz first: the audio thread waits for haptic quiet before
          * re-powering the mics, so the motor noise is not recorded. */
         haptic_play_pattern(HAPTIC_SHORT);
