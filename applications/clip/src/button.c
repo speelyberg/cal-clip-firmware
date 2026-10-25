@@ -29,11 +29,11 @@ static void *button_user_data = NULL;
 static atomic_t shutdown_lockout = ATOMIC_INIT(0);
 
 /*
- * Controls (thresholds in the board DTS: long-press-ms = <1000 8000>):
+ * Controls (thresholds in the board DTS: long-press-ms = <1000 5000>):
  *   tap (< 1 s)   toggle recording, decided by the event thread from the
  *                 audio lifecycle (CLIP_EVENT_TOGGLE)
  *   hold (>= 1 s) never toggles; releasing it shows the status bar
- *   8 s held      graceful shutdown at once, all further input ignored
+ *   5 s held      graceful shutdown at once, all further input ignored
  * The driver never reports a tap for a press that reached 1 s.
  */
 static void button_event_callback(const struct device *dev, enum button_action action)

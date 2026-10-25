@@ -20,12 +20,12 @@
 		 * release; 50 ms is checked on 30 ms polls, so it means seen
 		 * pressed on two polls: a glitch under ~30 ms can't toggle,
 		 * tools/cal/test_gpio_button.py). 1 s marks a hold, which never
-		 * toggles; 8 s powers off. No double-click (0 = no wait: the
-		 * tap is reported ~30 ms after release). The nPM1300 long-press
-		 * reset (~7 s, SHPHLD) still fires first unless the app has
-		 * CONFIG_CLIP_PMIC_LONG_PRESS_RESET_DISABLE. */
+		 * toggles; 5 s powers off. No double-click (0 = no wait: the
+		 * tap is reported ~30 ms after release). 5 s is ahead of the nPM1300
+		 * long-press reset (~7 s, SHPHLD), which stays as the safety net
+		 * (CONFIG_CLIP_PMIC_LONG_PRESS_RESET_DISABLE off). */
 		debounce-ms = <50>;
-		long-press-ms = <1000 8000>;
+		long-press-ms = <1000 5000>;
 		double-click-ms = <0>;
 		status = "okay";
 	};

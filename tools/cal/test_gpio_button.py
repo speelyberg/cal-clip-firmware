@@ -4,7 +4,7 @@ Compiles the real drivers/input/gpio_button.c with stub Zephyr headers, replays
 pin timelines on a virtual clock (k_sleep advances it; each GPIO edge wakes the
 polling loop, edges during a run re-wake it once, like the driver's drained
 semaphore) and checks the events the app gets: a tap toggles, a hold never
-does, 8 s powers off. Thresholds come from the board DTS.
+does, 5 s powers off. Thresholds come from the board DTS.
 """
 import re
 import shutil
@@ -149,7 +149,7 @@ class ButtonDriver(unittest.TestCase):
         return [a for _, a in self.events(*presses)]
 
     def test_thresholds(self):
-        self.assertEqual(self.cfg, [50, 1000, 8000, 0])
+        self.assertEqual(self.cfg, [50, 1000, 5000, 0])
 
     def test_tap_toggles_once_at_release(self):
         ev = self.events((1000, 1120))
@@ -179,14 +179,14 @@ class ButtonDriver(unittest.TestCase):
         self.assertEqual(self.actions((1000, 1004), (1008, 1130), (1140, 1143)), [CLICK])
 
     def test_hold_never_toggles(self):
-        for up in (1100 + 1000, 1000 + 3000, 1000 + 7900):
+        for up in (1100 + 1000, 1000 + 3000, 1000 + 4900):
             with self.subTest(hold=up - 1000):
                 self.assertEqual(self.actions((1000, up)), [LONG, RELEASE])
 
-    def test_eight_second_hold_powers_off_while_held(self):
+    def test_five_second_hold_powers_off_while_held(self):
         ev = self.events((1000, 1000 + 9500))
         self.assertEqual([a for _, a in ev], [LONG, LEVEL_1, RELEASE])
-        self.assertTrue(1000 + 8000 <= ev[1][0] < 1000 + 8000 + 60)   # no release needed
+        self.assertTrue(1000 + 5000 <= ev[1][0] < 1000 + 5000 + 60)   # no release needed
         self.assertEqual(ev[2][0], 1000 + 9500)
 
     def test_tap_after_power_off_hold(self):
